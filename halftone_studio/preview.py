@@ -31,17 +31,22 @@ class _Task(QRunnable):
     """單次半調計算任務。"""
 
     def __init__(self, emitter: _Emitter, job: int, gray: np.ndarray,
-                 params: HalftoneParams) -> None:
+                 params: HalftoneParams,
+                 origin: tuple[int, int] = (0, 0),
+                 full_shape: tuple[int, int] | None = None) -> None:
         super().__init__()
         self._emitter = emitter
         self._job = job
         self._gray = gray
         self._params = params
+        self._origin = origin
+        self._full_shape = full_shape
 
     @Slot()
     def run(self) -> None:
         try:
-            result = halftone(self._gray, self._params)
+            result = halftone(self._gray, self._params, self._origin,
+                              self._full_shape)
         except Exception as exc:
             self._emitter.failed.emit(self._job, str(exc))
             return
@@ -84,8 +89,18 @@ class PreviewController(QObject):
         if self._last_params is not None:
             self.request(self._last_params)
 
-    def request(self, params: HalftoneParams) -> None:
-        """送出計算請求，並記住參數供換圖時重用。"""
+    def request(self, params: HalftoneParams,
+                gray: np.ndarray | None = None,
+                origin: tuple[int, int] = (0, 0),
+                full_shape: tuple[int, int] | None = None) -> None:
+        """送出計算請求，並記住參數供換圖時重用。
+
+        帶入 gray 時會改用該影像；origin 為該影像在整張原圖中
+        的左上角座標，full_shape 為整張原圖尺寸，兩者讓裁切
+        區塊的網格與整圖完全一致。
+        """
+        if gray is not None:
+            self._gray = gray
         if self._gray is None:
             return
 
@@ -97,7 +112,9 @@ class PreviewController(QObject):
             self._busy = True
             self.busy_changed.emit(True)
 
-        self._pool.start(_Task(self._emitter, self._job, self._gray, params))
+        self._pool.start(
+            _Task(self._emitter, self._job, self._gray, params,
+                  origin, full_shape))
 
     def _on_done(self, job: int, result: np.ndarray) -> None:
         # 丟棄過期結果，只採用最新一次請求

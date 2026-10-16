@@ -2,10 +2,75 @@
 
 集中管理 QSS，讓介面風格一致且易於調整。
 所有介面文字皆為正體中文。
+
+增減按鈕的箭頭說明
+------------------
+只要對 QSpinBox 套用任何 QSS，Qt 就會改走 QSS 繪製路徑，此時
+Fusion 不再自動畫出增減箭頭，只會剩下兩個色塊（使用者實測回報）。
+用 image:none + border 三角形也無效。
+
+因此這裡在執行時產生真正的三角圖示 PNG，再由 QSS 引用。
 """
 from __future__ import annotations
 
-__all__ = ["STYLESHEET"]
+import os
+import tempfile
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import (
+    QColor, QPainter, QPen, QPixmap, QPolygonF,
+)
+
+__all__ = ["get_stylesheet"]
+
+
+def _arrow_icon(path: str, up: bool, color: str = "#b32f66",
+                size: int = 9) -> str:
+    """畫出上／下箭頭並存成 PNG，回傳檔案路徑。"""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    inset = 1.5
+    left, right = inset, size - inset
+    mid_x = size / 2.0
+    if up:
+        # 頂點在上
+        pts = [QPointF(left, size - inset), QPointF(mid_x, inset),
+               QPointF(right, size - inset)]
+    else:
+        # 頂點在下
+        pts = [QPointF(left, inset), QPointF(mid_x, size - inset),
+               QPointF(right, inset)]
+
+    pen = QPen(QColor(color))
+    pen.setWidth(2)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawPolyline(QPolygonF(pts))
+    p.end()
+
+    pm.save(path, "PNG")
+    return path.replace("\\", "/")
+
+
+def _ensure_arrow_icons() -> tuple[str, str, str]:
+    """產生（或沿用）箭頭圖示，回傳 (上, 下, 下拉) 路徑。"""
+    cache = os.path.join(tempfile.gettempdir(), "halftone_theme")
+    os.makedirs(cache, exist_ok=True)
+    up = os.path.join(cache, "arrow_up.png")
+    down = os.path.join(cache, "arrow_down.png")
+    combo = os.path.join(cache, "combo_down.png")
+    if not (os.path.exists(up) and os.path.exists(down)
+            and os.path.exists(combo)):
+        _arrow_icon(up, True)
+        _arrow_icon(down, False)
+        _arrow_icon(combo, False, color="#d1568c", size=10)
+    return (up.replace("\\", "/"), down.replace("\\", "/"),
+            combo.replace("\\", "/"))
 
 _BASE = """
 /* ── 整體底色與文字 ───────────────────────────── */
@@ -128,27 +193,25 @@ QDoubleSpinBox::up-button, QSpinBox::up-button,
 QDoubleSpinBox::down-button, QSpinBox::down-button {
     background-color: #ffd0e2;
     border: none;
-    width: 16px;
-    border-radius: 5px;
-    margin: 2px;
+    width: 18px;
+    margin: 1px;
 }
 QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover,
 QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover {
     background-color: #ffb0cb;
 }
+/* 增減箭頭：一旦對 QSpinBox 套用 QSS，Qt 就改走 QSS 繪製路徑，
+   Fusion 不再自動畫箭頭，只會剩兩個色塊。因此必須提供圖檔，
+   圖示於執行時由 _arrow_icon 產生。 */
 QDoubleSpinBox::up-arrow, QSpinBox::up-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-bottom: 5px solid #c94d80;
-    width: 0; height: 0;
+    image: url(%(up)s);
+    width: 9px;
+    height: 9px;
 }
 QDoubleSpinBox::down-arrow, QSpinBox::down-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #c94d80;
-    width: 0; height: 0;
+    image: url(%(down)s);
+    width: 9px;
+    height: 9px;
 }
 
 /* ── 下拉選單 ────────────────────────────────── */
@@ -162,11 +225,9 @@ QComboBox {
 QComboBox:hover { border-color: #ff8fb8; background-color: #fffafc; }
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox::down-arrow {
-    image: none;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 6px solid #d1568c;
-    width: 0; height: 0;
+    image: url(%(combo)s);
+    width: 10px;
+    height: 10px;
     margin-right: 8px;
 }
 QComboBox QAbstractItemView {
@@ -268,4 +329,16 @@ QLabel#imageView {
 }
 """
 
-STYLESHEET = _BASE
+_CACHED: str | None = None
+
+
+def get_stylesheet() -> str:
+    """回傳完整樣式表（含執行時產生的箭頭圖示路徑）。
+
+    必須在 QApplication 建立後呼叫。
+    """
+    global _CACHED
+    if _CACHED is None:
+        up, down, combo = _ensure_arrow_icons()
+        _CACHED = _BASE % {"up": up, "down": down, "combo": combo}
+    return _CACHED

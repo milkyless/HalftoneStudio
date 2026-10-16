@@ -12,8 +12,10 @@ import sys
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QImage, QPixmap
+from PySide6.QtCore import QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QAction, QBrush, QColor, QImage, QPainter, QPen, QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSplitter,
@@ -23,21 +25,31 @@ from PySide6.QtWidgets import (
 from .core import (
     DOT_SHAPES, HalftoneParams, halftone,
 )
+from .detail import DetailPane
 from .image_io import (
     OUTPUT_FILTER, PREVIEW_MAX_EDGE, ImageError, image_format_of,
     is_lossy_format, load_image, load_image_rgb, save_image,
 )
+from .icons import app_icon
 from .preview import PreviewController
-from .theme import STYLESHEET
+from .theme import get_stylesheet
 from .widgets import SliderSpin, add_row, build_group
 
 __all__ = ["MainWindow", "main"]
 
 APP_TITLE = "絲網印刷半調網點 Halftone Studio"
 
+# 控制面板的寬度範圍。設定上下限可避免面板被拉伸得過寬，
+# 或在視窗較窄時被擠壓而顯示不全。
+PANEL_MIN_WIDTH = 360
+PANEL_MAX_WIDTH = 420
+
 
 class ImageView(QLabel):
     """支援縮放與捲動的影像顯示區。"""
+
+    # 使用者在總覽圖上點擊（影像座標）
+    crop_clicked = Signal(int, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -45,6 +57,8 @@ class ImageView(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(320, 240)
         self._pixmap: QPixmap | None = None
+        self._crop: tuple[int, int, int, int] | None = None
+        self._shown_scale = 1.0
         self._zoom = 1.0
         self._fit = True
 
@@ -98,24 +112,83 @@ class ImageView(QLabel):
                 max(1, int(w * s)), max(1, int(h * s)),
                 Qt.KeepAspectRatio, Qt.FastTransformation)
             self.setPixmap(target)
-            self._shown = 1.0
+            # 記錄實際顯示比例，供裁切指示框換算座標
+            self._shown_scale = target.width() / w if w else 1.0
+            self.update()
             return
         w = int(self._pixmap.width() * self._zoom)
         h = int(self._pixmap.height() * self._zoom)
-        self.setPixmap(self._pixmap.scaled(
+        target = self._pixmap.scaled(
             max(1, w), max(1, h),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.setPixmap(target)
+        self._shown_scale = target.width() / self._pixmap.width() \
+            if self._pixmap.width() else 1.0
+        self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         if self._fit:
             self.update_view()
 
+    # ── 裁切指示框 ────────────────────────────────────────
+    def set_crop(self, x: int, y: int, w: int, h: int) -> None:
+        """設定裁切範圍（全解析度座標），並在圖上畫出指示框。"""
+        self._crop = (x, y, w, h)
+        self.update()
+
+    def crop_to_image(self, px: int, py: int) -> tuple[int, int] | None:
+        """把視窗座標換算回影像座標。"""
+        if self._pixmap is None:
+            return None
+        off = self._pixmap_offset()
+        s = self._shown_scale
+        if s <= 0:
+            return None
+        return (int((px - off[0]) / s), int((py - off[1]) / s))
+
+    def _pixmap_offset(self) -> tuple[int, int]:
+        if self._pixmap is None:
+            return (0, 0)
+        pm = self.pixmap()
+        if pm is None:
+            return (0, 0)
+        return ((self.width() - pm.width()) // 2,
+                (self.height() - pm.height()) // 2)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if self._crop is None or self._pixmap is None:
+            return
+        x, y, w, h = self._crop
+        s = self._shown_scale
+        if s <= 0:
+            return
+        off = self._pixmap_offset()
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor(255, 90, 150), 2))
+        p.setBrush(QBrush(QColor(255, 120, 175, 40)))
+        p.drawRect(QRectF(off[0] + x * s, off[1] + y * s,
+                          w * s, h * s))
+        p.end()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        pos = self.crop_to_image(event.position().x(),
+                                 event.position().y())
+        if pos is not None:
+            self.crop_clicked.emit(pos[0], pos[1])
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
+        self.setWindowIcon(app_icon())
         self.resize(1360, 880)
 
         self._gray: np.ndarray | None = None       # 預覽用灰階（縮圖）
@@ -123,6 +196,7 @@ class MainWindow(QMainWindow):
         self._rgb: np.ndarray | None = None        # 預覽用原始彩色
         self._result: np.ndarray | None = None     # 最近一次預覽輸出
         self._mode = "原圖"                         # 目前預覽模式
+        self._preview_scale = 1.0                  # 預覽縮圖的比例
         self._source_path: str | None = None
         self._seed = 0
 
@@ -133,6 +207,12 @@ class MainWindow(QMainWindow):
         self.controller.ready.connect(self._on_preview)
         self.controller.failed.connect(self._on_error)
         self.controller.busy_changed.connect(self._on_busy)
+
+        # 細節窗格同樣在背景執行緒計算全解析度結果
+        self.detail_ctrl = PreviewController(self)
+        self.detail_ctrl.ready.connect(self.detail.set_result)
+        self.detail_ctrl.failed.connect(self._on_error)
+        self.detail_ctrl.busy_changed.connect(self._on_detail_busy)
 
         # 拖動滑桿時節流，避免每個像素值都重算
         self._debounce = QTimer(self)
@@ -152,23 +232,56 @@ class MainWindow(QMainWindow):
         scroll.setAlignment(Qt.AlignCenter)
 
         right = QWidget()
+        right.setMinimumWidth(PANEL_MIN_WIDTH)
+        right.setMaximumWidth(PANEL_MAX_WIDTH)
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
-
+        rl.setSpacing(0)
         rl.addWidget(self._build_controls())
-        rl.addStretch(1)
+
+        # ── 控制面板捲動區 ──────────────────────────────────
+        # 參數項目較多，視窗較矮時若沒有捲動區，下半段的參數會被
+        # 直接切掉而看不到。改為放入捲動區並固定寬度範圍，
+        # 確保任何視窗大小下都能完整瀏覽。
+        panel_scroll = QScrollArea()
+        panel_scroll.setWidget(right)
+        panel_scroll.setWidgetResizable(True)
+        panel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        panel_scroll.setFrameShape(QScrollArea.NoFrame)
+        panel_scroll.setMinimumWidth(PANEL_MIN_WIDTH)
+        panel_scroll.setMaximumWidth(PANEL_MAX_WIDTH)
+        panel_scroll.setFocusPolicy(Qt.NoFocus)
 
         split = QSplitter(Qt.Horizontal)
         split.addWidget(scroll)
-        split.addWidget(right)
+        split.addWidget(panel_scroll)
         split.setStretchFactor(0, 1)
         split.setStretchFactor(1, 0)
-        split.setSizes([1000, 380])
+        split.setSizes([1000, PANEL_MAX_WIDTH])
+
+        # ── 細節放大窗格 ──────────────────────────────────
+        # 以全解析度計算指定區域，結果與匯出檔案逐像素相同，
+        # 可真正檢視網點細節，避免縮圖預覽與實際產出不同調。
+        self.detail = DetailPane()
+        self.detail.crop_changed.connect(self._on_crop_changed)
+        self.view.crop_clicked.connect(self.detail.move_crop)
+
+        top = QWidget()
+        tl = QVBoxLayout(top)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.addWidget(split)
+
+        vsplit = QSplitter(Qt.Vertical)
+        vsplit.addWidget(top)
+        vsplit.addWidget(self.detail)
+        vsplit.setStretchFactor(0, 1)
+        vsplit.setStretchFactor(1, 0)
+        vsplit.setSizes([620, 260])
 
         holder = QWidget()
         hl = QVBoxLayout(holder)
         hl.setContentsMargins(0, 0, 0, 0)
-        hl.addWidget(split)
+        hl.addWidget(vsplit)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -334,9 +447,27 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(has)
 
     # ── 參數 ──────────────────────────────────────────────
-    def _params(self) -> HalftoneParams:
+    def _params(self, for_preview: bool = False) -> HalftoneParams:
+        """組出參數。
+
+        for_preview=True 時會依預覽縮圖比例同步調整解析度。
+        網點尺寸是以像素計算的（解析度 ÷ 網點頻率），若圖片縮小
+        而解析度不變，網點相對整張圖會被放大數倍，預覽與實際產出
+        便完全對不上。這裡把解析度乘上縮圖比例，兩者尺度才一致。
+        """
+        resolution = self.sld_res.value()
+        if for_preview and self._preview_scale < 1.0:
+            # 網點尺寸 = 解析度 ÷ 頻率（單位是像素）。圖片縮小時若
+            # 解析度不變，網點相對整張圖會被放大數倍，預覽與實際
+            # 產出便完全對不上，因此要依縮圖比例同步縮小解析度。
+            resolution = resolution * self._preview_scale
+            # 但網點小於約 3 px 已接近取樣極限，再小只是雜訊。
+            # 此時維持 3 px，由「細節放大」窗格負責顯示真實網點。
+            resolution = max(resolution,
+                             3.0 * self.sld_freq.value())
+
         return HalftoneParams(
-            resolution=self.sld_res.value(),
+            resolution=resolution,
             frequency=self.sld_freq.value(),
             stochastic=self.sld_stoch.value(),
             angle=self.sld_angle.value(),
@@ -358,7 +489,21 @@ class MainWindow(QMainWindow):
     def _apply_preview(self) -> None:
         if self._gray is None:
             return
-        self.controller.request(self._params())
+        # 預覽用縮圖，解析度需同步縮放，尺度才與實際產出一致
+        self.controller.request(self._params(for_preview=True))
+        self._apply_detail()
+
+    def _apply_detail(self) -> None:
+        """以全解析度計算裁切區域，結果與匯出檔案逐像素相同。"""
+        if self._full_gray is None:
+            return
+        crop = self.detail.crop_source()
+        if crop is None or crop.size == 0:
+            return
+        cx, cy = self.detail.crop_rect()[:2]
+        fh, fw = self._full_gray.shape
+        # 傳入原圖座標與尺寸，網格才會與整圖完全對齊
+        self.detail_ctrl.request(self._params(), crop, (cx, cy), (fw, fh))
 
     def _on_preview(self, result: np.ndarray) -> None:
         self._result = result
@@ -393,6 +538,14 @@ class MainWindow(QMainWindow):
 
     def _on_busy(self, busy: bool) -> None:
         self.progress.setVisible(busy)
+
+    def _on_detail_busy(self, busy: bool) -> None:
+        self.detail.lbl_info.setEnabled(not busy)
+
+    def _on_crop_changed(self, x: int, y: int, w: int, h: int) -> None:
+        """裁切範圍改變時更新總覽圖上的指示框並重算細節。"""
+        self.view.set_crop(x, y, w, h)
+        self._apply_detail()
 
     def on_random_seed(self) -> None:
         self._seed = int(np.random.default_rng().integers(0, 1_000_000))
@@ -448,8 +601,14 @@ class MainWindow(QMainWindow):
         self._full_gray = full
         self._mode = "原圖"
 
+        # 預覽縮圖的比例：預覽時解析度需依此比例同步縮小，
+        # 否則網點相對整張圖會被放大，預覽與實際產出便對不上。
+        self._preview_scale = (self._gray.shape[1] / full.shape[1]
+                               if full.shape[1] else 1.0)
+
         self.view.set_rgb(self._rgb)
         self.view.fit()
+        self.detail.set_gray(full)
         self.controller.set_gray(self._gray)
         self._update_actions()
 
@@ -457,7 +616,7 @@ class MainWindow(QMainWindow):
         self.lbl_size.setText(
             f"原始尺寸 {full.shape[1]} × {full.shape[0]} px"
             + (f"\n預覽 {self._gray.shape[1]} × {self._gray.shape[0]} px"
-               if small else ""))
+               f"（{self._preview_scale:.0%}）" if small else ""))
         self.progress.setVisible(False)
         self._set_status(f"已載入 {name}（中繼資料已捨棄）")
 
@@ -537,16 +696,19 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.controller.shutdown()
+        self.detail_ctrl.shutdown()
         super().closeEvent(event)
 
 
 def main() -> int:
-    QApplication.setAttribute(
-        Qt.AA_DontCreateNativeWidgetSiblings, True)
+    # 注意：不可設定 Qt.AA_DontCreateNativeWidgetSiblings。
+    # 該屬性是為 QOpenGLWidget + QOpenGLWindow 的情境設計，
+    # 對一般 Widgets 介面會破壞原生元件的共用與繪製，
+    # 在打包後會導致右側控制面板整片消失。
     app = QApplication(sys.argv)
     app.setApplicationName("Halftone Studio")
     app.setStyle("Fusion")
-    app.setStyleSheet(STYLESHEET)
+    app.setStyleSheet(get_stylesheet())
 
     window = MainWindow()
     window.show()

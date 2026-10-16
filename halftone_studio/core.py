@@ -174,40 +174,60 @@ def _organic_distort(dx: np.ndarray, dy: np.ndarray, dist: np.ndarray,
 
 
 def _dot_metric(params: HalftoneParams, cell: int,
-                tile: int) -> np.ndarray:
-    """到最近網點中心的「形狀距離」場。
+                y0: int, rows: int, width: int,
+                origin_x: int = 0, origin_y: int = 0,
+                full_w: int | None = None,
+                full_h: int | None = None) -> np.ndarray:
+    """到最近網點中心的「形狀距離」場（整圖絕對座標）。
 
     位置與形狀是兩條獨立的軸：
-      - 位置：由 stochastic 決定。100% 為規則網格，
-              0% 為藍雜訊隨機散開的網點。
+      - 位置：由 stochastic 決定。100% 為規則網格，0% 為網點
+              中心各自隨機散開。
       - 形狀：由 dot_shape 決定，並對所有模式一致生效。
-              因為無論網點落在哪裡，都用同一套形狀距離度量。
 
     距離越接近 0 代表越靠近網點中心，在暗部會越早被填滿，
     網點因此由中心向外自然長大 —— 這是 AM（振幅調變）網屏原理。
+
+    重要：這裡一律使用「整張影像的絕對座標」，不對格點索引取模，
+    也不做任何平鋪。早期實作把門檻場切成小磚重複貼滿全圖，導致
+    24MP 影像上同一組隨機值重複兩萬多次，宏觀看又變回規則網點，
+    而且磚塊邊界會出現明顯接縫。
+
+    origin_x / origin_y：目前陣列在「整張原圖」中的左上角座標。
+    旋轉中心固定為整張原圖的中心，因此對同一區域單獨計算的結果
+    與整圖計算完全一致 —— 這是細節放大窗格能與匯出檔逐像素相符的
+    前提。若省略則視為從原圖 (0,0) 開始。
+
+    full_w / full_h：整張原圖的尺寸，決定旋轉中心。
     """
     rad = math.radians(params.angle)
     ca, sa = math.cos(rad), math.sin(rad)
 
-    half = tile * 0.5
-    gx, gy = np.meshgrid(np.arange(tile, dtype=np.float64),
-                         np.arange(tile, dtype=np.float64))
-    rx = (gx + 0.5 - half) * ca - (gy + 0.5 - half) * sa
-    ry = (gx + 0.5 - half) * sa + (gy + 0.5 - half) * ca
+    fw = full_w if full_w else width
+    fh = full_h if full_h else (origin_y + y0 + rows)
 
-    # 所屬網格（tile 為 cell 的整數倍，故可整除）
-    n = max(1, tile // cell)
-    gi = np.round(rx / cell).astype(np.int64)
-    gj = np.round(ry / cell).astype(np.int64)
-    gi_m = np.mod(gi, n)
-    gj_m = np.mod(gj, n)
+    # 以「整張原圖」的中心為旋轉中心，所有分帶共用同一套網格
+    gx = np.arange(width, dtype=np.float64) + origin_x + 0.5
+    gy = np.arange(y0, y0 + rows, dtype=np.float64) + origin_y + 0.5
+    X = np.broadcast_to(gx, (rows, width))
+    Y = np.broadcast_to(gy[:, None], (rows, width))
 
-    # 網點中心 = 規則格點 + 藍雜訊位移（有序模式位移為 0）
+    cx = fw * 0.5
+    cy = fh * 0.5
+    rx = (X - cx) * ca - (Y - cy) * sa
+    ry = (X - cx) * sa + (Y - cy) * ca
+
+    # 所屬網格：使用絕對索引，橫跨整張影像都不會重複
+    gi = np.rint(rx / cell).astype(np.int64)
+    gj = np.rint(ry / cell).astype(np.int64)
+
+    # 網點中心 = 規則格點 + 隨機位移（有序模式位移為 0）
     amp = (1.0 - params.stochastic) * cell * 0.35
     if amp > 1e-6:
-        ox, oy = _jitter_field(n, params.noise_size, params.seed, amp)
-        dx = rx - (gi * cell + ox[gi_m, gj_m])
-        dy = ry - (gj * cell + oy[gi_m, gj_m])
+        jx = (_cell_rand(gi, gj, params.seed, 1) * 2.0 - 1.0) * amp
+        jy = (_cell_rand(gi, gj, params.seed, 2) * 2.0 - 1.0) * amp
+        dx = rx - (gi * cell + jx)
+        dy = ry - (gj * cell + jy)
     else:
         dx = rx - gi * cell
         dy = ry - gj * cell
@@ -226,24 +246,53 @@ def _dot_metric(params: HalftoneParams, cell: int,
     # 隨機有機模式：每顆顆粒套用專屬的隨機輪廓，模擬銀鹽晶體
     if params.dot_shape == DOT_ORGANIC:
         # 給一個足夠明顯的預設擾動量，讓顆粒輪廓清晰可辨
-        amp = max(params.shape_amount, 0.55)
-        dist = _organic_distort(dx, dy, dist, gi, gj, params.seed, amp)
+        amp_o = max(params.shape_amount, 0.55)
+        dist = _organic_distort(dx, dy, dist, gi, gj, params.seed, amp_o)
 
     return dist
 
 
+# 直方圖 CDF 的分箱數。距離場與色調無關，逐帶歸一化即可正確還原密度，
+# 因此不需要完整排序；分箱數決定門檻的量化精度。
+_CDF_BINS = 16384
+
 
 def _rank_uniform(values: np.ndarray) -> np.ndarray:
-    """把任意數值場轉為 0..1 上均勻分佈的門檻場。
+    """把距離場轉為 0..1 上均勻分佈的門檻場（以直方圖近似 CDF）。
 
-    排名化是關鍵：門檻均勻分佈時，每個區塊的上墨率才會精確
-    等於該區塊的暗度，這是有序抖動能正確還原灰階的前提。
+    為什麼需要這一步：網點位置隨機抖動之後，相鄰網點會互相靠近甚至
+    重疊。此時單純用「面積正比於距離平方」計算，會把重疊的部分重複
+    計入，導致暗部實際上墨率嚴重偏低（實測最多低估 30%）。
+
+    把距離場歸一化成均勻分佈的門檻後，任意區塊的上墨率就會精確
+    等於該區塊的暗度 —— 這正是有序抖動還原灰階的原理。
+
+    用直方圖累積分布代替完整排序：距離場與色調無關，因此逐帶計算
+    CDF 即可得到正確的局部密度，不必做全域排序。速度是排序的數倍，
+    記憶體也只需 O(帶寬)。
     """
     flat = values.ravel()
-    order = np.argsort(flat, kind="stable")
-    out = np.empty(flat.size, dtype=np.float32)
-    out[order] = np.linspace(0.0, 1.0, flat.size, dtype=np.float32)
-    return out.reshape(values.shape)
+    lo = float(flat.min())
+    hi = float(flat.max())
+    if hi <= lo:
+        return np.zeros_like(values, dtype=np.float32)
+
+    bins = _CDF_BINS
+    pos = (flat - lo) * ((bins - 1) / (hi - lo))
+    idx = np.clip(pos, 0, bins - 1).astype(np.int32)
+
+    counts = np.bincount(idx, minlength=bins)
+    cdf = np.cumsum(counts, dtype=np.float64)
+    cdf /= cdf[-1]
+
+    # 以相鄰 bin 做線性內插，精度優於 bin 寬度
+    i0 = idx
+    i1 = np.minimum(i0 + 1, bins - 1)
+    frac = pos - i0
+    out = cdf[i0] * (1.0 - frac) + cdf[i1] * frac
+
+    return out.reshape(values.shape).astype(np.float32)
+
 
 
 def _tie_break(gy: np.ndarray, gx: np.ndarray, seed: int) -> np.ndarray:
@@ -271,46 +320,19 @@ def _cell_px(params: HalftoneParams) -> int:
     return max(1, min(512, int(round(raw))))
 
 
-def _build_threshold(params: HalftoneParams,
-                     out_shape: tuple[int, int]) -> np.ndarray:
-    """產生套用到整張影像的門檻場（0..1，均勻分佈）。
-
-    隨機網與有序網依 stochastic 連續過渡：
-        1.0 = 傳統重複網點網格
-        0.0 = 藍雜訊隨機顆粒
-    """
-    cell = _cell_px(params)
-    # 磚大小取網格的整數倍，確保網格能無縫對接
-    tile = cell * 4
-
-    # 形狀距離場：同時帶入網點位置（有序 / 隨機）與網點形狀
-    base = _dot_metric(params, cell, tile)
-
-    # 網點不規則度：以低頻諧波擾動距離場，讓網點邊界有機而不死板。
-    # 隨機有機模式已在 _organic_distort 內做逐顆擾動，此處略過避免疊加。
-    # 在排名化之前施加，因此不影響整體密度還原。
-    if params.shape_amount > 0.0 and params.dot_shape != DOT_ORGANIC:
-        yy, xx = np.mgrid[0:tile, 0:tile].astype(np.float64)
-        yy = yy / tile * math.tau
-        xx = xx / tile * math.tau
-        wobble = (np.sin(xx * 3.0 + yy * 2.0) * 0.6 +
-                  np.sin(yy * 5.0 - xx * 1.0) * 0.4)
-        base = base + wobble * (params.shape_amount * cell * 0.12)
-
-    th = _rank_uniform(base)
-
-    # 以索引取模平鋪，避免複製整塊磚造成記憶體暴增
-    rows = np.arange(out_shape[0], dtype=np.int32) % tile
-    cols = np.arange(out_shape[1], dtype=np.int32) % tile
-    return th[np.ix_(rows, cols)]
-
-
-
-def halftone(gray: np.ndarray, params: HalftoneParams) -> np.ndarray:
+def halftone(gray: np.ndarray, params: HalftoneParams,
+             origin: tuple[int, int] = (0, 0),
+             full_shape: tuple[int, int] | None = None) -> np.ndarray:
     """將灰階圖轉為二值半調網點（黑墨白底）。
 
     輸入 : (H, W) 或 (H, W, 1) 灰階，取值 0..1（0 = 黑）
     輸出 : (H, W) 的 uint8，0 = 滿墨（黑）、255 = 紙白
+
+    origin：輸入陣列在「整張原圖」中的左上角座標 (x, y)。
+    full_shape：整張原圖的尺寸 (寬, 高)，決定網格旋轉中心。
+      傳入這兩項時，對同一區域單獨計算的結果會與整圖計算完全
+      相同 —— 這是細節放大窗格能與匯出檔逐像素相符的前提。
+      省略時視為整張影像即從 (0,0) 開始。
     """
     errors = params.validate()
     if errors:
@@ -332,12 +354,43 @@ def halftone(gray: np.ndarray, params: HalftoneParams) -> np.ndarray:
     # 最小 / 最大網點夾限：暗部保留細節、高光避免死黑
     t = np.clip(t, params.min_dot, params.max_dot)
 
-    threshold = _build_threshold(params, tone.shape)
+    height, width = t.shape
+    cell = _cell_px(params)
 
-    # ── 二值判定 ────────────────────────────────────────────
-    # 灰階越暗代表該處該上越多的墨。
-    # 門檻場在 0..1 上均勻分佈，故任何區塊的上墨率恰等於
-    # 該區塊的暗度 1 - tone —— 這正是有序抖動的原理，
-    # 無需任何全域密度校準。
-    ink = t < (1.0 - threshold)
-    return np.where(ink, 0, 255).astype(np.uint8)
+    ox, oy = origin
+    if full_shape:
+        full_w, full_h = full_shape
+    else:
+        full_w, full_h = ox + width, oy + height
+
+    out = np.empty((height, width), dtype=np.uint8)
+
+    # ── 分帶處理 ────────────────────────────────────────────
+    # 一次算完整張影像會產生數個大型暫存陣列。分帶處理把記憶體
+    # 壓在固定水位；因為距離場與色調無關，逐帶歸一化仍能讓
+    # 每個區塊的上墨率精確還原其暗度。
+    target_px = 1 << 21                      # 每帶約 200 萬像素
+    strip = max(64, (target_px // max(1, width)))
+
+    for y0 in range(0, height, strip):
+        rows = min(strip, height - y0)
+        dist = _dot_metric(params, cell, y0, rows, width,
+                           origin_x=ox, origin_y=oy,
+                           full_w=full_w, full_h=full_h)
+
+        # 網點不規則度：以低頻諧波擾動距離場，讓網點邊界有機。
+        # 隨機有機模式已在 _organic_distort 內逐顆擾動，此處略過。
+        if params.shape_amount > 0.0 and params.dot_shape != DOT_ORGANIC:
+            yy = (np.arange(rows, dtype=np.float64)[:, None] + oy + y0) / cell
+            xx = (np.arange(width, dtype=np.float64)[None, :] + ox) / cell
+            wobble = (np.sin(xx * 3.0 + yy * 2.0) * 0.6 +
+                      np.sin(yy * 5.0 - xx * 1.0) * 0.4)
+            dist = dist + wobble * (params.shape_amount * cell * 0.12)
+
+        # 門檻場在 0..1 上均勻分佈，故上墨率恰等於該處暗度
+        threshold = _rank_uniform(dist)
+
+        dark = 1.0 - t[y0:y0 + rows]
+        out[y0:y0 + rows] = np.where(dark > threshold, 0, 255)
+
+    return out
