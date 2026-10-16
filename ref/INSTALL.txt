@@ -1,0 +1,27 @@
+Installation instructions for GIMP Plug-in "Printable Halftone"
+---------------------------------------------------------------
+
+System requirements:
+* GIMP 2.6       (tested with Ubuntu Linux 10.04 LTS)
+* GCC            (tested with version 4.4.3 and GNU C Library 2.11.1)
+
+* GTK+ 2.0       (tested with version 2.20.1)
+  (packages libgtk2.0-0, libgtk2.0-bin, libgtk2.0-common libgtk2.0-dev
+   in Ubuntu)
+
+* GLib 2.0       (tested with version 2.24.1)
+  (packages libglib2.0-0, libglib2.0-data and libglib2.0-dev in Ubuntu)
+
+* GIMP library   (tested with version 2.6.8)
+  (packages libgimp2.0 and libgimp2.0-dev in Ubuntu)
+
+Installation via command line:
+* Go to the directory where you extracted the tarball.
+
+* Type 'gimptool-2.0 --install printable-halftone.c'
+  (or 'gimptool-2.0 --install-admin printable-halftone.c' if you want
+   to install to all users in the system)
+
+* Run GIMP. The plug-in is located in the main menu as
+  Filters > Distortions > Printable Halftone.
+

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 專案產物
+out/
+build/artifacts/
+*.spec
+dist/
+
+# 舊 GIMP 外掛的相依標頭檔（僅供編譯用，體積大）
+deps/
+
+# 測試產物
+test/output/
+*.pgm
+*.png
+!docs/*.png
+*.log

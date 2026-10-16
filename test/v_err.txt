@@ -1,0 +1,7 @@
+GIMP-錯誤: 開啟「C:\Users\Milky\Desktop\Z\test\verify.scm)」失敗：Error when getting information for file “C:\Users\Milky\Desktop\Z\test\verify.scm)”: No such file or directory
+
+GIMP-錯誤: 開啟「C:\Users\Milky\Desktop\Z\0)」失敗：Error when getting information for file “C:\Users\Milky\Desktop\Z\0)”: No such file or directory
+
+batch command experienced an execution error:
+Error: syntax error: expected right paren, found EOF 
+Stopping at failing batch command [0]: (load

@@ -1,0 +1,5 @@
+(let* ((r (gimp-procedural-db-proc-info "film-halftone")))
+  (if (car r)
+      (gimp-message (string-append "PROC_OK nargs=" (number->string (cadr r))))
+      (gimp-message "PROC_MISSING")))
+(gimp-quit 0)

@@ -1,0 +1,8 @@
+處理程序「python-fu-eval-3.2」不是有效的批次直譯器。
+批次模式已停用。
+
+可用的直譯器有：
+- plug-in-script-fu-eval (Script-fu (scheme))
+- python-fu-eval (Python 3)
+
+請指定下列直譯器其中之一來作為 --batch-interpreter 選項。

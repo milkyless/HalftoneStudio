@@ -1,0 +1,41 @@
+Parsing 'D:\Software\GIMP 3\etc\gimp\3.0\gimprc' for configuration data required during early initialization.
+Parsing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\gimprc' for configuration data required during early initialization.
+Language property found: zh_TW.
+Parsing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\extensionrc'
+INIT: gimp_load_config
+Parsing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\unitrc'
+Parsing 'D:\Software\GIMP 3\etc\gimp\3.0\gimprc'
+Parsing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\gimprc'
+INIT: gimp_initialize
+INIT: gimp_real_initialize
+Parsing 'D:\Software\GIMP 3\lib\gimp\3.0\interpreters\gimp-script-fu-interpreter.interp'
+Parsing 'D:\Software\GIMP 3\lib\gimp\3.0\interpreters\pygimp.interp'
+Parsing 'D:\Software\GIMP 3\lib\gimp\3.0\environ\default.env'
+Parsing 'D:\Software\GIMP 3\lib\gimp\3.0\environ\pygimp.env'
+INIT: gimp_restore
+Parsing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\parasiterc'
+Parsing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\colorrc'
+Parsing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\templaterc'
+INIT: gimp_real_restore
+Parsing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\pluginrc'
+Querying plug-in: 'D:\Software\GIMP 3\lib\gimp\3.0\plug-ins\file-rawtherapee\file-rawtherapee.exe'
+Querying plug-in: 'D:\Software\GIMP 3\lib\gimp\3.0\plug-ins\file-darktable\file-darktable.exe'
+Querying plug-in: 'D:\Software\GIMP 3\lib\gimp\3.0\plug-ins\file-another-rawtherapee\file-another-rawtherapee.exe'
+Initializing plug-in: 'D:\Software\GIMP 3\lib\gimp\3.0\plug-ins\file-rawtherapee\file-rawtherapee.exe'
+Initializing plug-in: 'D:\Software\GIMP 3\lib\gimp\3.0\plug-ins\file-heif\file-heif.exe'
+Initializing plug-in: 'D:\Software\GIMP 3\lib\gimp\3.0\plug-ins\file-darktable\file-darktable.exe'
+Initializing plug-in: 'D:\Software\GIMP 3\lib\gimp\3.0\plug-ins\file-another-rawtherapee\file-another-rawtherapee.exe'
+Initializing plug-in: 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\plug-ins\film-halftone\film-halftone.exe'
+Writing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\pluginrc'
+Starting extension: 'extension-script-fu'
+Writing 'C:\Users\Milky\AppData\Roaming\GIMP\3.2\gimprc'
+[gimp-film-halftone] The catalog directory does not exist: C:\Users\Milky\AppData\Roaming\GIMP\3.2\plug-ins\film-halftone\locale
+[gimp-film-halftone] Override method set_i18n() for the plug-in to customize or disable localization.
+[gimp-film-halftone] Localization disabled
+script-fu.exe-警告: === BEGIN SIGNATURE ===
+
+batch command experienced an execution error:
+Error: car: argument 1 must be: pair (C:/Users/Milky/Desktop/Z/test/probe.scm : 32)  
+Stopping at failing batch command [0]: (load "C:/Users/Milky/Desktop/Z/test/probe.scm")
+
+*** TIMEOUT ***

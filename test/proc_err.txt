@@ -1,0 +1,3 @@
+[gimp-film-halftone] The catalog directory does not exist: C:\Users\Milky\AppData\Roaming\GIMP\3.2\plug-ins\film-halftone\locale
+[gimp-film-halftone] Override method set_i18n() for the plug-in to customize or disable localization.
+[gimp-film-halftone] Localization disabled
