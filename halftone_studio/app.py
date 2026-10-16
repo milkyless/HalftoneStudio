@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 
 import numpy as np
@@ -23,7 +24,8 @@ from .core import (
     DOT_SHAPES, HalftoneParams, halftone,
 )
 from .image_io import (
-    PREVIEW_MAX_EDGE, SUPPORTED_OUTPUT, ImageLoadError, load_image, save_png,
+    OUTPUT_FILTER, PREVIEW_MAX_EDGE, ImageError, image_format_of,
+    is_lossy_format, load_image, load_image_rgb, save_image,
 )
 from .preview import PreviewController
 from .theme import STYLESHEET
@@ -51,6 +53,14 @@ class ImageView(QLabel):
                      array.strides[0], QImage.Format_Grayscale8)
         # 保持記憶體有效，QImage 不會自行複製
         img = img.copy()
+        self._pixmap = QPixmap.fromImage(img)
+        self.update_view()
+
+    def set_rgb(self, array: np.ndarray) -> None:
+        """顯示原始彩色影像（已轉為 RGB888）。"""
+        rgb = np.ascontiguousarray(array, dtype=np.uint8)
+        img = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
+                     rgb.strides[0], QImage.Format_RGB888).copy()
         self._pixmap = QPixmap.fromImage(img)
         self.update_view()
 
@@ -110,9 +120,11 @@ class MainWindow(QMainWindow):
 
         self._gray: np.ndarray | None = None       # 預覽用灰階（縮圖）
         self._full_gray: np.ndarray | None = None  # 全解析度灰階
+        self._rgb: np.ndarray | None = None        # 預覽用原始彩色
+        self._result: np.ndarray | None = None     # 最近一次預覽輸出
+        self._mode = "原圖"                         # 目前預覽模式
         self._source_path: str | None = None
         self._seed = 0
-        self._result: np.ndarray | None = None     # 全解析度輸出
 
         self._build_ui()
         self._build_menu()
@@ -178,9 +190,13 @@ class MainWindow(QMainWindow):
         files, fl = build_group("檔案")
         self.btn_open = QPushButton("開啟 JPG…")
         self.btn_open.clicked.connect(self.on_open)
-        self.btn_export = QPushButton("匯出 PNG…")
+        self.btn_export = QPushButton("匯出 PNG / JPG…")
         self.btn_export.clicked.connect(self.on_export)
+        self.btn_compare = QPushButton("顯示原圖")
+        self.btn_compare.clicked.connect(self.on_toggle_compare)
+        self.btn_compare.setEnabled(False)
         add_row(fl, "來源", self.btn_open)
+        add_row(fl, "對照", self.btn_compare)
         add_row(fl, "輸出", self.btn_export)
         layout.addWidget(files)
 
@@ -276,7 +292,7 @@ class MainWindow(QMainWindow):
         self.act_open.triggered.connect(self.on_open)
         file_menu.addAction(self.act_open)
 
-        self.act_export = QAction("匯出 PNG…", self)
+        self.act_export = QAction("匯出 PNG / JPG…", self)
         self.act_export.setShortcut("Ctrl+S")
         self.act_export.triggered.connect(self.on_export)
         file_menu.addAction(self.act_export)
@@ -345,7 +361,31 @@ class MainWindow(QMainWindow):
         self.controller.request(self._params())
 
     def _on_preview(self, result: np.ndarray) -> None:
+        self._result = result
+        self._mode = "網點預覽"
         self.view.set_image(result)
+        self._update_compare()
+
+    def on_toggle_compare(self) -> None:
+        """在原始彩色影像與網點預覽之間切換，用於對照。"""
+        if self._rgb is None:
+            return
+        if self._mode == "原圖":
+            if self._result is not None:
+                self.view.set_image(self._result)
+                self._mode = "網點預覽"
+        else:
+            self.view.set_rgb(self._rgb)
+            self._mode = "原圖"
+        self._update_compare()
+
+    def _update_compare(self) -> None:
+        has = self._result is not None and self._rgb is not None
+        self.btn_compare.setEnabled(has)
+        if not has:
+            return
+        show_original = self._mode != "原圖"
+        self.btn_compare.setText("顯示原圖" if show_original else "顯示網點")
 
     def _on_error(self, message: str) -> None:
         self.progress.setVisible(False)
@@ -376,35 +416,50 @@ class MainWindow(QMainWindow):
 
     def on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "開啟影像", "", "影像檔 (*.jpg *.jpeg *.png)")
+            self, "開啟影像", "", "影像檔 (*.jpg *.jpeg *.png *.JPG *.JPEG)")
         if not path:
             return
 
         self.progress.setVisible(True)
         QApplication.processEvents()
 
+        name = path.rsplit(chr(92), 1)[-1]
         try:
+            # 只讀取可見像素：EXIF 僅用於轉正方向，其餘中繼資料丟棄
             full = load_image(path)
-        except ImageLoadError as exc:
+            full_rgb = load_image_rgb(path)
+        except ImageError as exc:
+            self.progress.setVisible(False)
+            QMessageBox.critical(self, "開啟失敗", str(exc))
+            return
+
+        small = max(full.shape) > PREVIEW_MAX_EDGE
+        try:
+            self._gray = (load_image(path, max_edge=PREVIEW_MAX_EDGE)
+                          if small else full)
+            self._rgb = (load_image_rgb(path, max_edge=PREVIEW_MAX_EDGE)
+                         if small else full_rgb)
+        except ImageError as exc:
             self.progress.setVisible(False)
             QMessageBox.critical(self, "開啟失敗", str(exc))
             return
 
         self._source_path = path
         self._full_gray = full
-        self._gray = (load_image(path, max_edge=PREVIEW_MAX_EDGE)
-                      if max(full.shape) > PREVIEW_MAX_EDGE else full)
+        self._mode = "原圖"
 
-        self.controller.set_gray(self._gray)
+        self.view.set_rgb(self._rgb)
         self.view.fit()
+        self.controller.set_gray(self._gray)
         self._update_actions()
 
-        self.setWindowTitle(f"{APP_TITLE} — {path.rsplit(chr(92), 1)[-1]}")
+        self.setWindowTitle(f"{APP_TITLE} — {name}")
         self.lbl_size.setText(
-            f"原始尺寸 {full.shape[1]} × {full.shape[0]} px\n"
-            f"預覽 {self._gray.shape[1]} × {self._gray.shape[0]} px")
+            f"原始尺寸 {full.shape[1]} × {full.shape[0]} px"
+            + (f"\n預覽 {self._gray.shape[1]} × {self._gray.shape[0]} px"
+               if small else ""))
         self.progress.setVisible(False)
-        self._set_status(f"已載入 {path.rsplit(chr(92), 1)[-1]}")
+        self._set_status(f"已載入 {name}（中繼資料已捨棄）")
 
     def on_export(self) -> None:
         if self._full_gray is None:
@@ -419,9 +474,27 @@ class MainWindow(QMainWindow):
         base = (self._source_path.rsplit(chr(92), 1)[-1].rsplit(".", 1)[0]
                 if self._source_path else "halftone")
         path, _ = QFileDialog.getSaveFileName(
-            self, "匯出 PNG", f"{base}_halftone.png", SUPPORTED_OUTPUT)
+            self, "匯出影像", f"{base}_halftone.png", OUTPUT_FILTER)
         if not path:
             return
+
+        # 副檔名決定格式；未支援的副檔名一律以 PNG 輸出
+        fmt = image_format_of(path)
+        if not path.lower().endswith((".png", ".jpg", ".jpeg", ".jpe")):
+            path = f"{os.path.splitext(path)[0]}.png"
+            fmt = "PNG"
+
+        # JPEG 為有損壓縮，二值網點邊緣會出現灰階雜訊，先行確認
+        if is_lossy_format(fmt):
+            ok = QMessageBox.question(
+                self, "確認以 JPEG 輸出",
+                "JPEG 是有損壓縮格式，純黑白的網點邊緣在存檔後\n"
+                "會出現灰階雜訊，可能影響製版品質。\n\n"
+                "程式會以最高畫質輸出以降低失真，但仍有殘留。\n"
+                "若要拿來實際製版，建議改用 PNG（無損）。\n\n"
+                "仍要以 JPEG 輸出嗎？")
+            if ok != QMessageBox.Yes:
+                return
 
         self.progress.setVisible(True)
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -429,7 +502,7 @@ class MainWindow(QMainWindow):
 
         try:
             result = halftone(self._full_gray, params)
-            save_png(result, path)
+            save_image(result, path)
         except Exception as exc:
             QMessageBox.critical(self, "匯出失敗", str(exc))
             self._set_status("匯出失敗")
@@ -438,11 +511,14 @@ class MainWindow(QMainWindow):
             self._set_status(
                 f"已匯出 {path.rsplit(chr(92), 1)[-1]}"
                 f"（{result.shape[1]}×{result.shape[0]}，上墨率 {ink:.1f}%）")
+            note = ("\n\n注意：JPEG 為有損格式，網點邊緣可能有灰階雜訊。"
+                    if is_lossy_format(fmt) else "")
             QMessageBox.information(
                 self, "匯出完成",
-                f"已輸出至：\n{path}\n\n"
+                f"已另存至：\n{path}\n\n"
+                f"格式 {fmt}（不含任何中繼資料）\n"
                 f"尺寸 {result.shape[1]} × {result.shape[0]} px\n"
-                f"上墨率 {ink:.1f}%")
+                f"上墨率 {ink:.1f}%{note}")
         finally:
             QApplication.restoreOverrideCursor()
             self.progress.setVisible(False)

@@ -1,65 +1,151 @@
-"""影像讀寫與灰階轉換。
+"""影像讀寫與元資料處理。
+
+設計原則
+--------
+讀入時只取「可見的像素資料」：會依 EXIF Orientation 轉正（否則顯示
+方向會錯），其餘 EXIF、相機資訊、GPS、ICC 描述檔、縮圖預覽等一律丟棄，
+絕不帶入處理流程。
+
+輸出時另存新檔，同樣只寫入像素資料，不寫入任何 EXIF 或文字區塊。
+
+關於 JPG
+--------
+JPEG 是有損壓縮：純黑白的網點邊緣存檔後會出現灰階雜訊。
+若要拿去實際製版請使用 PNG（無損）。
+程式仍提供 JPG 選項，並以最高畫質（quality=100、4:4:4 無色度抽樣）
+把失真降到最低。
 
 僅依賴 Pillow 與 NumPy，不涉及任何外部影像軟體。
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from PIL import Image, ImageOps
 
-__all__ = ["load_image", "save_png", "SUPPORTED_INPUT", "SUPPORTED_OUTPUT"]
-
-SUPPORTED_INPUT = (
-    "*.jpg", "*.jpeg", "*.JPG", "*.JPEG", "*.png", "*.PNG",
-)
-SUPPORTED_OUTPUT = "PNG 影像 (*.png)"
+__all__ = [
+    "load_image", "load_image_rgb", "save_image", "image_format_of",
+    "ImageError", "PREVIEW_MAX_EDGE", "OUTPUT_FILTER", "is_lossy_format",
+]
 
 # 預覽用的長邊上限，避免超大影像拖慢介面
 PREVIEW_MAX_EDGE = 1400
 
+# 另存新檔時的檔案類型篩選字串
+OUTPUT_FILTER = ("PNG 影像（無損，建議） (*.png);;"
+                 "JPEG 影像（有損壓縮） (*.jpg *.jpeg);;"
+                 "所有檔案 (*.*)")
 
-class ImageLoadError(Exception):
-    """影像無法讀取時拋出。"""
+
+class ImageError(Exception):
+    """影像讀寫失敗時拋出。"""
 
 
-def load_image(path: str, max_edge: int | None = None) -> np.ndarray:
-    """讀取影像並轉為灰階 float32 陣列（0..1，0 = 黑）。
+# ── 讀入：只取可見像素 ──────────────────────────
+def _open_visible(path: str) -> Image.Image:
+    """開啟影像並依 EXIF Orientation 轉正。
 
-    參數 max_edge 指定時，會等比例縮小使長邊不超過該值。
+    EXIF 僅用於修正方向，轉成獨立影像後即與其脫鉤，
+    其餘中繼資料一概不取。
     """
     try:
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im)
-            im = im.convert("L")
-
-            if max_edge:
-                w, h = im.size
-                longest = max(w, h)
-                if longest > max_edge:
-                    scale = max_edge / longest
-                    new = (max(1, int(round(w * scale))),
-                           max(1, int(round(h * scale))))
-                    im = im.resize(new, Image.LANCZOS)
-
-            arr = np.asarray(im, dtype=np.uint8)
-    except ImageLoadError:
+            return im.copy()          # 脫離原檔案，中繼資料不再相連
+    except ImageError:
         raise
     except Exception as exc:
-        raise ImageLoadError(f"無法讀取影像：{exc}") from exc
+        raise ImageError(f"無法讀取影像：{exc}") from exc
+
+
+def _resize(img: Image.Image, max_edge: int | None) -> Image.Image:
+    if not max_edge:
+        return img
+    w, h = img.size
+    longest = max(w, h)
+    if longest <= max_edge:
+        return img
+    scale = max_edge / longest
+    return img.resize((max(1, round(w * scale)),
+                       max(1, round(h * scale))),
+                      Image.LANCZOS)
+
+
+def load_image(path: str, max_edge: int | None = None) -> np.ndarray:
+    """讀入影像並轉為灰階 float32 陣列（0..1，0 = 黑）。
+
+    參數 max_edge 指定時，會等比例縮小使長邊不超過該值。
+    回傳值只有像素資料，不含任何中繼資料。
+    """
+    with _open_visible(path) as img:
+        with img.convert("L") as gray:
+            arr = np.asarray(_resize(gray, max_edge), dtype=np.uint8)
 
     if arr.size == 0:
-        raise ImageLoadError("影像內容為空")
+        raise ImageError("影像內容為空")
+    return arr.astype(np.float32) / 255.0
 
-    return (arr.astype(np.float32) / 255.0)
+
+def load_image_rgb(path: str, max_edge: int | None = None) -> np.ndarray:
+    """讀入影像並轉為 RGB uint8 陣列，供介面預覽原始色彩使用。"""
+    with _open_visible(path) as img:
+        with img.convert("RGB") as rgb:
+            arr = np.asarray(_resize(rgb, max_edge), dtype=np.uint8)
+
+    if arr.size == 0:
+        raise ImageError("影像內容為空")
+    return arr
 
 
-def save_png(array: np.ndarray, path: str) -> None:
-    """將 (H, W) 的 uint8 陣列存成 PNG。
+# ── 輸出：另存新檔，只寫像素 ────────────────────
+def image_format_of(path: str) -> str:
+    """依副檔名判斷輸出格式，未支援者一律視為 PNG。"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".jpg", ".jpeg", ".jpe"):
+        return "JPEG"
+    return "PNG"
 
-    以 L 模式輸出，確保是真正的 8 位元灰階（黑墨白底），
-    不會因為 RGB 轉換而讓邊緣出現灰階鋸齒。
+
+def is_lossy_format(fmt: str) -> bool:
+    """該格式是否為有損壓縮。"""
+    return fmt.upper() in ("JPEG", "JPG")
+
+
+def save_image(array: np.ndarray, path: str, quality: int = 100) -> str:
+    """將 (H, W) 的 uint8 陣列另存新檔。
+
+    只寫入可見像素資料：不附加 EXIF、文字區塊或任何中繼資料。
+
+    以 L（8 位元灰階）模式輸出，確保是真正的黑白網點，
+    不會因 RGB 轉換讓邊緣出現灰階鋸齒。
+
+    回傳實際寫入的檔案格式（'PNG' 或 'JPEG'）。
     """
+    if array.ndim != 2:
+        raise ImageError("輸出必須是 (H, W) 的二維灰階陣列")
     if array.dtype != np.uint8:
         array = np.clip(array, 0, 255).astype(np.uint8)
-    Image.fromarray(array, mode="L").save(path, format="PNG",
-                                          optimize=True)
+
+    fmt = image_format_of(path)
+
+    # 明確指定 format，且不傳入任何 pnginfo / exif，
+    # 確保輸出檔案不含中繼資料。
+    img = Image.fromarray(array, mode="L")
+
+    try:
+        if fmt == "JPEG":
+            img.save(path, format="JPEG",
+                     quality=max(1, min(100, quality)),
+                     subsampling=0,      # 4:4:4，不做色度抽樣
+                     optimize=True,
+                     exif=b"")           # 明確清空 EXIF
+        else:
+            img.save(path, format="PNG",
+                     optimize=True,
+                     pnginfo=None)       # 明確不寫入文字區塊
+    except Exception as exc:
+        raise ImageError(f"無法寫入影像：{exc}") from exc
+
+    return fmt
+
