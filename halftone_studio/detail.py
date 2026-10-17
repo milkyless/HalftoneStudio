@@ -45,12 +45,9 @@ class DetailPane(QWidget):
         root.setSpacing(4)
 
         # ── 工具列 ──────────────────────────────────────
+        # 不放標題文字：浮動視窗的標題列已經有「細節放大」了
         bar = QHBoxLayout()
         bar.setSpacing(6)
-
-        title = QLabel("細節放大")
-        title.setStyleSheet("font-weight: bold; color: #b8396f;")
-        bar.addWidget(title)
 
         self.cmb_size = QComboBox()
         for w, h in CROP_SIZES:
@@ -245,9 +242,14 @@ class _ResizeGrip(QWidget):
 class DetailWindow(QWidget):
     """浮動的細節放大視窗。
 
-    做成獨立的無邊框視窗而非底部面板，才能疊在主預覽之上，
-    不佔用固定版面；使用者可隨時拖到任何位置或關閉。
+    做成獨立的無邊框視窗而非底部面板，才能疊在主預覽之上、不佔版面。
+
+    位置是**固定的**：右下角恆常錨定在主預覽區的右下角，不可拖曳移動。
+    使用者仍可調整大小（往左上拉），但位置永遠由錨點決定，
+    尺寸也永遠不會超出主視窗。
     """
+
+    close_requested = Signal()
 
     def __init__(self, pane: DetailPane,
                  parent: QWidget | None = None) -> None:
@@ -259,14 +261,12 @@ class DetailWindow(QWidget):
         self.setMinimumSize(320, 240)
         self.pane = pane
         self._target: QWidget | None = None
-        self._offset = QPoint(0, 0)
-        self._drag_from: tuple | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(1, 1, 1, 1)
         outer.setSpacing(0)
 
-        # ── 標題列：左上角控制點 + 可拖曳區 + 關閉鈕 ──
+        # ── 標題列：左上角控制點 + 關閉鈕 ──
         bar = QWidget()
         bar.setFixedHeight(22)
         bar.setStyleSheet(
@@ -276,7 +276,7 @@ class DetailWindow(QWidget):
         bl.setSpacing(0)
         bl.addWidget(_ResizeGrip(bar))
 
-        self.title = QLabel(" 細節放大（拖曳可移動）")
+        self.title = QLabel(" 細節放大")
         self.title.setStyleSheet(
             "color: #8c2a55; font-size: 11px; font-weight: bold;"
             "background: transparent;")
@@ -293,7 +293,9 @@ class DetailWindow(QWidget):
             " color: #b8396f; font-size: 15px; font-weight: bold;"
             " padding: 0; }"
             "QPushButton:hover { background: #ff7fb5; color: white; }")
-        btn_close.clicked.connect(self.hide)
+        # 不可直接呼叫 hide()：選單的勾選狀態要一併取消，
+        # 由主視窗統一處理
+        btn_close.clicked.connect(self.close_requested.emit)
         bl.addWidget(btn_close)
 
         outer.addWidget(bar)
@@ -302,8 +304,7 @@ class DetailWindow(QWidget):
 
     # ── 位置 ────────────────────────────────────────────
     # 浮動視窗的右下角恆常錨定在主預覽區的右下角，角對角嚴格對齊
-    # （MARGIN = 0）。使用者仍可拖曳移動，移動量會記成相對錨點的
-    # 偏移，主視窗移動或縮放時依此偏移重新定位。
+    # （MARGIN = 0）。位置是固定的，不可拖曳移動。
     MARGIN = 0
 
     def _fit_to_parent(self) -> None:
@@ -356,7 +357,10 @@ class DetailWindow(QWidget):
         return QPoint(x, y)
 
     def reanchor(self) -> None:
-        """依目前目標重新定位，保持右下角對齊與使用者的拖曳偏移。"""
+        """依目前目標重新定位，右下角嚴格角對角對齊。
+
+        位置完全由錨點決定，沒有任何可拖曳的偏移量。
+        """
         if getattr(self, "_busy_anchor", False):
             return
         t = getattr(self, "_target", None)
@@ -370,9 +374,7 @@ class DetailWindow(QWidget):
             # 超出主視窗而找不回來。
             self._fit_to_parent()
             g = self._anchor_global()
-            pos = self._clamp_inside(g.x() + self._offset.x(),
-                                     g.y() + self._offset.y())
-            self.move(pos)
+            self.move(self._clamp_inside(g.x(), g.y()))
         finally:
             self._busy_anchor = False
         # 主視窗被點選或重繪後，浮動視窗可能被蓋到後面，這裡補一次置前
@@ -382,23 +384,3 @@ class DetailWindow(QWidget):
         super().resizeEvent(event)
         # 使用者把視窗拉大超出主視窗時，立刻夾回範圍內
         self.reanchor()
-
-    def drag_begin(self, pos) -> None:
-        p = pos.toPoint() if hasattr(pos, "toPoint") else pos
-        self._drag_from = (p, self.geometry())
-
-    def drag_move(self, pos) -> None:
-        if self._drag_from is None:
-            return
-        origin, geo = self._drag_from
-        cur = pos.toPoint() if hasattr(pos, "toPoint") else pos
-        d = cur - origin
-        nx, ny = geo.x() + d.x(), geo.y() + d.y()
-
-        # 記成相對錨點的偏移，主視窗移動後才不會被拉回原位
-        anchor = self._anchor_global()
-        self._offset = QPoint(nx - anchor.x(), ny - anchor.y())
-        self.move(nx, ny)
-
-    def drag_end(self) -> None:
-        self._drag_from = None

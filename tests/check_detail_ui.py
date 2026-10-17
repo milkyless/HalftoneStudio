@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt                          # noqa: E402
 from PySide6.QtGui import QImage, QMouseEvent                          # noqa: E402
 from PySide6.QtWidgets import (                                     # noqa: E402
-    QApplication, QPushButton, QScrollArea, QSplitter,
+    QApplication, QLabel, QPushButton, QScrollArea, QSplitter,
 )
 
 from halftone_studio.app import MainWindow                             # noqa: E402
@@ -135,14 +135,31 @@ check("往左上拖曳可放大",
 check("右下角固定（不會超出主視窗右下方）",
       after.right() == right and after.bottom() == bottom)
 
+# 位置不可拖曳：沒有拖曳處理器，也不該有偏移狀態
+check("DetailWindow 不提供拖曳移動功能",
+      not hasattr(dw, "drag_begin") and not hasattr(dw, "drag_move")
+      and not hasattr(dw, "drag_end"),
+      f"（drag_* 方法存在：{[m for m in ('drag_begin', 'drag_move', 'drag_end') if hasattr(dw, m)]}）")
+check("DetailWindow 無拖曳偏移狀態 _offset", not hasattr(dw, "_offset"))
+
+# 產品介面不該出現「位置固定」之類的操作說明文字
+titles = [dw.title.text()] + [w.text() for w in dw.findChildren(QLabel)
+                             if w.text().strip()]
+banned = ("固定", "拖曳可移動", "拖动", "錨定", "無法拖")
+dirty = [(t, b) for t in titles for b in banned if b in t]
+check("介面上沒有操作說明文字", not dirty,
+      f"（發現 {dirty}；標題：{titles[:4]}）")
+
+# 直接對標題列送滑鼠事件，位置不應改變
 pos_before = dw.pos()
-win.eventFilter(dw.title, QMouseEvent(
+dw.title.mousePressEvent(QMouseEvent(
     QEvent.MouseButtonPress, QPointF(40, 10), QPointF(40, 10),
     Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
-win.eventFilter(dw.title, QMouseEvent(
+dw.title.mouseMoveEvent(QMouseEvent(
     QEvent.MouseMove, QPointF(140, 110), QPointF(140, 110),
     Qt.NoButton, Qt.LeftButton, Qt.NoModifier))
-check("拖曳標題列可移動視窗", dw.pos() != pos_before,
+app.processEvents()
+check("在標題列拖曳不會移動視窗", dw.pos() == pos_before,
       f"（{pos_before.x()},{pos_before.y()} -> "
       f"{dw.pos().x()},{dw.pos().y()}）")
 
@@ -157,32 +174,63 @@ def gap():
     return v_g.x() - d_g.x(), v_g.y() - d_g.y()
 
 
-dw._offset = QPoint(0, 0)
 dw.reanchor()
 app.processEvents()
 g = gap()
-check("無偏移時右下角完全重合（誤差 <=1px）",
+check("右下角完全重合（誤差 <=1px）",
       abs(g[0]) <= 1 and abs(g[1]) <= 1,
       f"（右緣差 {g[0]}px、下緣差 {g[1]}px）")
 
-# 有偏移時應維持該偏移
-off_x, off_y = dw._offset.x(), dw._offset.y()
 for mv in ((80, 60), (-140, 100), (0, -90)):
     win.move(win.pos().x() + mv[0], win.pos().y() + mv[1])
     app.processEvents()
     g = gap()
-    check(f"主視窗移動 {mv} 後維持對齊",
-          abs(g[0] + off_x) <= 2 and abs(g[1] + off_y) <= 2,
-          f"（右緣差 {g[0]}、下緣差 {g[1]}，應為 {-off_x}、{-off_y}）")
+    check(f"主視窗移動 {mv} 後維持對齊", abs(g[0]) <= 2 and abs(g[1]) <= 2,
+          f"（右緣差 {g[0]}、下緣差 {g[1]}，應為 0、0）")
 
 win.resize(1300, 800)
 app.processEvents()
 g = gap()
-check("主視窗縮放後維持對齊",
-      abs(g[0] + off_x) <= 2 and abs(g[1] + off_y) <= 2,
-      f"（右緣差 {g[0]}、下緣差 {g[1]}，應為 {-off_x}、{-off_y}）")
+check("主視窗縮放後維持對齊", abs(g[0]) <= 2 and abs(g[1]) <= 2,
+      f"（右緣差 {g[0]}、下緣差 {g[1]}，應為 0、0）")
 win.resize(1500, 940)
 app.processEvents()
+
+print("\n=== 5b2. 連續拖動主視窗，每一步都必須錨住 ===")
+# 模擬真人拖曳視窗標題列：一連串小幅位移，而不是一次到位
+worst = 0
+for i in range(40):
+    win.move(win.pos().x() + 7, win.pos().y() + 5)
+    app.processEvents()
+    g = gap()
+    worst = max(worst, abs(g[0]), abs(g[1]))
+check("連續拖動 40 步全程錨定", worst <= 1,
+      f"（最大偏移 {worst}px）")
+
+# 連續縮放（來回），每一步都要維持
+worst2 = 0
+for i in range(20):
+    w = 1300 + (i % 7) * 30
+    h = 860 + (i % 5) * 24
+    win.resize(w, h)
+    app.processEvents()
+    g = gap()
+    worst2 = max(worst2, abs(g[0]), abs(g[1]))
+check("連續縮放 20 次全程錨定", worst2 <= 1,
+      f"（最大偏移 {worst2}px）")
+win.resize(1500, 940)
+app.processEvents()
+
+# 邊拖主視窗、邊縮放浮窗，兩者交錯
+worst3 = 0
+for i in range(10):
+    win.move(win.pos().x() + 11, win.pos().y() - 7)
+    dw.resize(420 + i * 20, 300 + i * 14)
+    app.processEvents()
+    g = gap()
+    worst3 = max(worst3, abs(g[0]), abs(g[1]))
+check("主視窗移動 + 浮窗縮放交錯時仍錨定", worst3 <= 1,
+      f"（最大偏移 {worst3}px）")
 
 print("\n=== 5c. 不被蓋到後面 / 不超出主視窗 ===")
 check("浮動視窗是主視窗的子視窗（Qt.Tool 才能維持置頂）",
@@ -252,12 +300,31 @@ app.processEvents()
 dw.reanchor()
 app.processEvents()
 
-win._on_detail_close(type("E", (), {"accept": lambda s: None})())
+win._on_detail_close()
 check("關閉鈕可隱藏視窗", not dw.isVisible())
-check("選單勾選同步取消", not win.act_detail.isChecked())
+check("關閉後選單勾選同步取消", not win.act_detail.isChecked())
 win.act_detail.setChecked(True)
 app.processEvents()
-check("選單可重新叫回視窗", dw.isVisible())
+check("選單點一次即可重新叫回視窗", dw.isVisible(),
+      f"（勾選狀態 {win.act_detail.isChecked()}）")
+
+print("\n=== 5d. 關閉鈕與選單雙向同步 ===")
+# 直接按鈕（走真實訊號路徑），確認選單狀態同步
+close_btn = [b for b in dw.findChildren(QPushButton)
+             if b.toolTip().startswith("關閉")]
+check("找得到關閉鈕", bool(close_btn))
+if close_btn:
+    close_btn[0].click()
+    app.processEvents()
+    check("按 × 後視窗隱藏", not dw.isVisible())
+    check("按 × 後選單勾選同步取消", not win.act_detail.isChecked())
+    # 關閉 -> 選單點一次 -> 必須直接開啟
+    win.act_detail.setChecked(True)
+    app.processEvents()
+    check("選單點一次即恢復（不需點兩次）", dw.isVisible())
+    check("恢復後右下角仍角對角對齊",
+          all(abs(x) <= 1 for x in gap()),
+          f"（右緣差 {gap()[0]}、下緣差 {gap()[1]}）")
 
 # 內容不應把視窗撐大（否則關閉鈕會被擠出畫面）
 dw.resize(640, 470)

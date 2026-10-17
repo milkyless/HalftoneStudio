@@ -342,9 +342,8 @@ class MainWindow(QMainWindow):
         self.view.crop_clicked.connect(self.detail.move_crop)
 
         self.detail_win = DetailWindow(self.detail, parent=self)
-        self.detail_win.title.installEventFilter(self)
+        self.detail_win.close_requested.connect(self._on_detail_close)
         self.view.installEventFilter(self)
-        self.detail_win.closeEvent = self._on_detail_close
 
         top = QWidget()
         tl = QVBoxLayout(top)
@@ -753,14 +752,18 @@ class MainWindow(QMainWindow):
         self._export_fmt = fmt
         self.export_ctrl.start(self._full_gray, params, path)
 
-    def _on_detail_close(self, event) -> None:  # noqa: N802
-        """關閉鈕只隱藏視窗，不銷毀 —— 使用者再次點按即可復原。"""
+    def _on_detail_close(self) -> None:
+        """關閉鈕：隱藏視窗並同步取消選單勾選。
+
+        必須一併取消勾選，否則選單仍顯示為啟用，使用者得點兩次
+        才能重新叫出視窗。
+        """
         self.detail_win.hide()
         if hasattr(self, "act_detail"):
             self.act_detail.blockSignals(True)
             self.act_detail.setChecked(False)
             self.act_detail.blockSignals(False)
-        event.accept()
+        self._set_status("已關閉細節放大視窗（檢視選單可重新開啟）")
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         dw = getattr(self, "detail_win", None)
@@ -772,21 +775,6 @@ class MainWindow(QMainWindow):
         if obj is self.view and event.type() == QEvent.Resize:
             dw.reanchor()
             return False
-
-        # 浮動視窗標題列：按左鍵拖曳即可移動
-        if obj is dw.title:
-            et = event.type()
-            if et == QEvent.MouseButtonPress and \
-                    event.button() == Qt.LeftButton:
-                dw.drag_begin(event.globalPosition())
-                return True
-            if et == QEvent.MouseMove and \
-                    (event.buttons() & Qt.LeftButton):
-                dw.drag_move(event.globalPosition())
-                return True
-            if et == QEvent.MouseButtonRelease:
-                dw.drag_end()
-                return True
         return super().eventFilter(obj, event)
 
     def event(self, e) -> bool:  # noqa: N802
