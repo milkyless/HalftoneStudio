@@ -17,9 +17,9 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt                          # noqa: E402
-from PySide6.QtGui import QMouseEvent                                  # noqa: E402
+from PySide6.QtGui import QImage, QMouseEvent                          # noqa: E402
 from PySide6.QtWidgets import (                                     # noqa: E402
-    QApplication, QPushButton, QScrollArea,
+    QApplication, QPushButton, QScrollArea, QSplitter,
 )
 
 from halftone_studio.app import MainWindow                             # noqa: E402
@@ -146,16 +146,9 @@ check("拖曳標題列可移動視窗", dw.pos() != pos_before,
       f"（{pos_before.x()},{pos_before.y()} -> "
       f"{dw.pos().x()},{dw.pos().y()}）")
 
-print("\n=== 5b. 右下角恆常錨定 ===")
-# 拖曳後記下的偏移量（向右下為正，故右下角間距會相應減少）
-off_x = dw._offset.x()
-off_y = dw._offset.y()
-check("拖曳被記成相對錨點的偏移", (off_x, off_y) != (0, 0),
-      f"（偏移 {off_x},{off_y}）")
-
-# 錨點間距 12；使用者往右下拖多少，右下角間距就減多少
-want_x = DetailWindow.MARGIN - off_x
-want_y = DetailWindow.MARGIN - off_y
+print("\n=== 5b. 右下角嚴格角對角錨定 ===")
+check("MARGIN 為 0（角對角嚴格對齊）", DetailWindow.MARGIN == 0,
+      f"（MARGIN={DetailWindow.MARGIN}）")
 
 
 def gap():
@@ -164,33 +157,100 @@ def gap():
     return v_g.x() - d_g.x(), v_g.y() - d_g.y()
 
 
-# 主視窗移動 -> 浮窗必須同步
-for mv in ((80, 60), (-140, 100), (0, -90)):
-    win.move(win.pos().x() + mv[0], win.pos().y() + mv[1])
-    app.processEvents()
-    g = gap()
-    check(f"主視窗移動 {mv} 後仍對齊右下角",
-          abs(g[0] - want_x) <= 2 and abs(g[1] - want_y) <= 2,
-          f"（右緣差 {g[0]}、下緣差 {g[1]}，應為 {want_x}、{want_y}）")
-
-# 主視窗縮放 -> 同樣維持
-win.resize(1300, 800)
-app.processEvents()
-g = gap()
-check("主視窗縮放後仍對齊右下角",
-      abs(g[0] - want_x) <= 2 and abs(g[1] - want_y) <= 2,
-      f"（右緣差 {g[0]}、下緣差 {g[1]}，應為 {want_x}、{want_y}）")
-win.resize(1500, 940)
-app.processEvents()
-
-# 沒有偏移時應精確貼齊（含 12px 間距）
 dw._offset = QPoint(0, 0)
 dw.reanchor()
 app.processEvents()
 g = gap()
-check("無偏移時精確貼齊右下角（間距 12px）",
-      g[0] == 12 and g[1] == 12,
-      f"（右緣差 {g[0]}、下緣差 {g[1]}）")
+check("無偏移時右下角完全重合（誤差 <=1px）",
+      abs(g[0]) <= 1 and abs(g[1]) <= 1,
+      f"（右緣差 {g[0]}px、下緣差 {g[1]}px）")
+
+# 有偏移時應維持該偏移
+off_x, off_y = dw._offset.x(), dw._offset.y()
+for mv in ((80, 60), (-140, 100), (0, -90)):
+    win.move(win.pos().x() + mv[0], win.pos().y() + mv[1])
+    app.processEvents()
+    g = gap()
+    check(f"主視窗移動 {mv} 後維持對齊",
+          abs(g[0] + off_x) <= 2 and abs(g[1] + off_y) <= 2,
+          f"（右緣差 {g[0]}、下緣差 {g[1]}，應為 {-off_x}、{-off_y}）")
+
+win.resize(1300, 800)
+app.processEvents()
+g = gap()
+check("主視窗縮放後維持對齊",
+      abs(g[0] + off_x) <= 2 and abs(g[1] + off_y) <= 2,
+      f"（右緣差 {g[0]}、下緣差 {g[1]}，應為 {-off_x}、{-off_y}）")
+win.resize(1500, 940)
+app.processEvents()
+
+print("\n=== 5c. 不被蓋到後面 / 不超出主視窗 ===")
+check("浮動視窗是主視窗的子視窗（Qt.Tool 才能維持置頂）",
+      dw.parentWidget() is win, f"（parent={dw.parentWidget()}）")
+
+# 拖曳分隔線改變預覽區大小也要跟著錨定
+dw._offset = QPoint(0, 0)
+dw.reanchor()
+splits = win.findChildren(QSplitter)
+split = splits[0] if splits else None
+check("找得到分隔線控件", split is not None)
+before_w = v.width()
+if split is not None:
+    split.setSizes([700, 800])
+    app.processEvents()
+    g = gap()
+    check("拖曳分隔線改變預覽寬度後仍錨定",
+          v.width() != before_w and abs(g[0]) <= 1 and abs(g[1]) <= 1,
+          f"（預覽寬 {before_w} -> {v.width()}，右緣差 {g[0]}、"
+          f"下緣差 {g[1]}）")
+    split.setSizes([1000, 500])
+    app.processEvents()
+
+win.raise_()
+win.activateWindow()
+app.processEvents()
+check("主視窗置前後浮動視窗仍可見", dw.isVisible())
+
+
+def report_bounds():
+    """回報浮動視窗與主視窗的邊界，並判斷四邊是否都在範圍內。"""
+    mw = win.mapToGlobal(QPoint(0, 0))
+    dg = dw.mapToGlobal(QPoint(0, 0))
+    dg_r = dg.x() + dw.width() - 1
+    dg_b = dg.y() + dw.height() - 1
+    mw_r = mw.x() + win.width() - 1
+    mw_b = mw.y() + win.height() - 1
+    inside = (dg.x() >= mw.x() and dg.y() >= mw.y()
+              and dg_r <= mw_r and dg_b <= mw_b)
+    detail = (f"（浮窗 {dg.x()},{dg.y()} ~ {dg_r},{dg_b}；"
+              f"主視窗 {mw.x()},{mw.y()} ~ {mw_r},{mw_b}）")
+    return inside, detail
+
+
+dw.resize(5000, 4000)
+app.processEvents()
+inside, detail = report_bounds()
+check("浮動視窗不超出主視窗範圍", inside, detail)
+
+win.resize(700, 480)
+app.processEvents()
+dw.reanchor()
+app.processEvents()
+inside, detail = report_bounds()
+check("主視窗縮小後浮動視窗仍被夾在範圍內", inside, detail)
+
+# 尺寸上限也不能超過主視窗
+dw.resize(5000, 4000)
+app.processEvents()
+check("浮動視窗最大尺寸受主視窗限制",
+      dw.maximumWidth() <= win.width() and dw.maximumHeight() <= win.height(),
+      f"（上限 {dw.maximumWidth()}x{dw.maximumHeight()}，"
+      f"主視窗 {win.width()}x{win.height()}）")
+
+win.resize(1500, 940)
+app.processEvents()
+dw.reanchor()
+app.processEvents()
 
 win._on_detail_close(type("E", (), {"accept": lambda s: None})())
 check("關閉鈕可隱藏視窗", not dw.isVisible())
@@ -230,15 +290,23 @@ if close_btn:
           f"底色 {base.name()}）")
 
 
-print("\n=== 2. 點擊選取位置 ===")
+print("\n=== 2. 點擊選取位置與框線對齊 ===")
 win.detail.cmb_size.setCurrentIndex(0)   # 640x480
 app.processEvents()
 cw, ch = 640, 480
 
-pm = v.pixmap()
-off = v._pixmap_offset()
-px = off[0] + int(pm.width() * 0.75)
-py = off[1] + int(pm.height() * 0.75)
+drawn = v.drawn_rect()
+check("影像確實繪製在控件內", not drawn.isEmpty(),
+      f"（矩形 {drawn.x()},{drawn.y()} {drawn.width()}x{drawn.height()}，"
+      f"控件 {v.width()}x{v.height()}）")
+check("影像未被控件裁切",
+      drawn.width() <= v.width() and drawn.height() <= v.height(),
+      f"（影像 {drawn.width()}x{drawn.height()} vs 控件 "
+      f"{v.width()}x{v.height()}）")
+
+# 點影像的 75% 位置
+px = drawn.left() + int(drawn.width() * 0.75)
+py = drawn.top() + int(drawn.height() * 0.75)
 
 full_pos = v.crop_to_image(px, py)
 expect = (int(full.shape[1] * 0.75), int(full.shape[0] * 0.75))
@@ -259,6 +327,92 @@ check("細節視窗裁切中心與點擊處一致", dcx < cw and dcy < ch,
 box = win.view._crop
 check("總覽上的指示框同步更新", box is not None and box[2] == gw,
       f"（指示框 {box}）")
+
+# ── 框線實際畫出來的位置是否正確 ──────────────────────
+# 直接從畫面上找出粉紅框線的像素範圍，比對理論值。
+
+
+def pink_bbox(img):
+    """回傳畫面上粉紅框線的像素範圍 (minx, miny, maxx, maxy)。"""
+    im = img.convertToFormat(QImage.Format_RGB32)
+    w, h = im.width(), im.height()
+    bpl = im.bytesPerLine()
+    buf = np.frombuffer(im.constBits(), dtype=np.uint8, count=bpl * h)
+    arr = buf.reshape(h, bpl)[:, :w * 4].reshape(h, w, 4)
+    r = arr[:, :, 2].astype(np.int16)
+    g = arr[:, :, 1].astype(np.int16)
+    b = arr[:, :, 0].astype(np.int16)
+    mask = ((abs(r - 255) < 40) & (abs(g - 90) < 45)
+            & (abs(b - 150) < 45))
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+app.processEvents()
+box = win.view._crop
+# grab() 回傳的是裝置像素（高 DPI 螢幕為邏輯像素的 2 倍），
+# 理論值必須乘上 devicePixelRatio 才可比對。
+_dpr = v.grab().devicePixelRatio()
+bb = pink_bbox(v.grab().toImage())
+fw, fh = full.shape[1], full.shape[0]
+exp_x = (drawn.left() + box[0] / fw * drawn.width()) * _dpr
+exp_y = (drawn.top() + box[1] / fh * drawn.height()) * _dpr
+exp_w = box[2] / fw * drawn.width() * _dpr
+exp_h = box[3] / fh * drawn.height() * _dpr
+
+check("總覽上找得到粉紅框線", bb is not None,
+      f"（像素範圍 {bb}，DPR={_dpr}）")
+if bb:
+    minx, miny, maxx, maxy = bb
+    ex = (minx + maxx + 1) / 2
+    ey = (miny + maxy + 1) / 2
+    tx = exp_x + exp_w / 2
+    ty = exp_y + exp_h / 2
+    dc = max(abs(ex - tx), abs(ey - ty))
+    # 框線筆寬 2 邏輯 px，筆畫向兩側各外擴 1px，量到的像素框會比
+    # 邏輯矩形大 2px（裝置像素為 2*DPR）。
+    pad = 2 * _dpr
+    dwid = abs((maxx - minx + 1) - exp_w - pad)
+    dhei = abs((maxy - miny + 1) - exp_h - pad)
+    check("框線中心與理論位置一致（誤差 <=3px）", dc <= 3,
+          f"（畫面中心 {ex:.1f},{ey:.1f}，理論 {tx:.1f},{ty:.1f}，"
+          f"差 {dc:.1f}px）")
+    check("框線尺寸與理論一致（扣筆寬後誤差 <=4px）",
+          dwid <= 4 and dhei <= 4,
+          f"（畫面 {maxx-minx+1}x{maxy-miny+1}，"
+          f"理論 {exp_w:.1f}+筆寬{pad:.0f}={exp_w+pad:.1f} "
+          f"x {exp_h+pad:.1f}）")
+
+# 放大模式下框線仍須正確（QLabel 私自縮放最容易在這裡出錯）
+fit_w = drawn.width()
+win.view.set_zoom(2.0)
+app.processEvents()
+d2 = v.drawn_rect()
+check("放大 2 倍後影像確實變大", d2.width() >= fit_w * 1.9,
+      f"（置合 {fit_w}px -> 放大 {d2.width()}px）")
+check("放大後控件長到可捲動範圍（捲軸才會出現）",
+      v.minimumWidth() >= d2.width(),
+      f"（控件最小寬 {v.minimumWidth()} vs 影像寬 {d2.width()}）")
+bb2 = pink_bbox(v.grab().toImage())
+check("放大後仍找得到框線", bb2 is not None, f"（像素範圍 {bb2}）")
+if bb2:
+    # 捲動後可視區只看到影像的一部分，因此框線寬度以「實際繪製
+    # 位置換算」為準，不可用置合模式的尺寸。
+    rel_x = (d2.left() + box[0] / fw * d2.width()) * _dpr
+    rel_w = box[2] / fw * d2.width() * _dpr
+    part = max(0.0, (v.grab().toImage().width() - rel_x)) * _dpr
+    expect_w = min(rel_w, part) + 2 * _dpr
+    got_w = bb2[2] - bb2[0] + 1
+    check("放大後框線寬度與繪製位置相符（誤差 <=12px）",
+          abs(got_w - expect_w) <= 12,
+          f"（畫面 {got_w}px，預期 {expect_w:.0f}px）")
+win.view.fit()
+app.processEvents()
+check("回到置合模式後控件恢復最小尺寸",
+      v.minimumWidth() <= 321 and v.minimumHeight() <= 241,
+      f"（最小 {v.minimumWidth()}x{v.minimumHeight()}）")
 
 print("\n=== 3. 匯出不凍結介面 ===")
 # 匯出完成會彈模態 QMessageBox，processEvents 會卡在對話框裡等人點，

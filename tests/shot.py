@@ -69,18 +69,17 @@ for _ in range(40):
 
 # 拉大浮窗以便看清
 dw = win.detail_win
-before = dw.geometry()
-right, bottom = before.right(), before.bottom()
-dw.setGeometry(right - 640 + 1, bottom - 470 + 1, 640, 470)
+dw.resize(720, 520)
 app.processEvents()
 for _ in range(40):
     app.processEvents()
 
+v_g = win.view.mapToGlobal(QPoint(win.view.width(), win.view.height()))
+d_g = dw.mapToGlobal(QPoint(dw.width(), dw.height()))
 print("浮窗尺寸:", dw.size().toTuple(),
-      " minHint:", dw.minimumSizeHint().toTuple(),
-      " 面板 minHint:", dw.pane.minimumSizeHint().toTuple(),
-      " 捲動區 minHint:", dw.pane.scroll.minimumSizeHint().toTuple(),
-      " 標籤 minHint:", dw.pane.lbl.minimumSizeHint().toTuple())
+      " 主視窗:", win.size().toTuple())
+print("角對角誤差:  右", v_g.x() - d_g.x(), "px  下",
+      v_g.y() - d_g.y(), "px")
 
 shot = DOCS / "ui_float.png"
 win.grab().save(str(shot))
@@ -90,6 +89,13 @@ print("主視窗截图:", shot, f"{shot.stat().st_size/1024:.0f} KB")
 dshot = DOCS / "ui_float_win.png"
 win.detail_win.grab().save(str(dshot))
 print("浮動視窗截图:", dshot, f"{dshot.stat().st_size/1024:.0f} KB")
+
+# 整個畫面：唯一能同時看到兩個視窗、驗證角對角錨定的角度
+screen = app.primaryScreen()
+if screen is not None:
+    sshot = DOCS / "ui_desktop.png"
+    screen.grabWindow(0).save(str(sshot))
+    print("桌面截图:", sshot, f"{sshot.stat().st_size/1024:.0f} KB")
 
 win.detail_win.close()
 win.close()

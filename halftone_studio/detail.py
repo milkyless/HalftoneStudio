@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, Qt, Signal
 from PySide6.QtGui import (
     QColor, QImage, QPainter, QPen, QPixmap, QPolygonF,
 )
@@ -251,11 +251,12 @@ class DetailWindow(QWidget):
 
     def __init__(self, pane: DetailPane,
                  parent: QWidget | None = None) -> None:
-        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint)
-        # 保留在主視窗之上，且不搶焦點，點擊主預覽仍能改變選取位置
+        # 必須指定 parent：Qt.Tool 唯有在有父子關係時才會自動維持在
+        # 父視窗之上。若傳 None，它就是一般頂層視窗，主視窗一旦被
+        # 點選而提到最前面，浮動視窗就會被蓋到後面去。
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setMinimumSize(320, 240)
-        self.setMaximumSize(2400, 1800)
         self.pane = pane
         self._target: QWidget | None = None
         self._offset = QPoint(0, 0)
@@ -300,17 +301,33 @@ class DetailWindow(QWidget):
         self._bar = bar
 
     # ── 位置 ────────────────────────────────────────────
-    # 浮動視窗的右下角恆常錨定在主預覽區的右下角。使用者仍可拖曳
-    # 移動，移動量會記成相對錨點的偏移，主視窗移動或縮放時依此
-    # 偏移重新定位，因此「右下角對齊」的關係始終成立。
-    MARGIN = 12
+    # 浮動視窗的右下角恆常錨定在主預覽區的右下角，角對角嚴格對齊
+    # （MARGIN = 0）。使用者仍可拖曳移動，移動量會記成相對錨點的
+    # 偏移，主視窗移動或縮放時依此偏移重新定位。
+    MARGIN = 0
+
+    def _fit_to_parent(self) -> None:
+        """限制尺寸不得超出主視窗，避免視窗被拖到畫面外找不回來。"""
+        p = self.parentWidget()
+        if p is None:
+            return
+        self.setMaximumSize(max(self.minimumWidth(), p.width()),
+                            max(self.minimumHeight(), p.height()))
+        if self.width() > p.width():
+            self.resize(p.width(), self.height())
+        if self.height() > p.height():
+            self.resize(self.width(), p.height())
 
     def anchor_to(self, target: QWidget) -> None:
         """把右下角錨定到目標元件（主預覽區）的右下角。"""
         self._target = target
+        self._fit_to_parent()
         self.adjustSize()
-        w = min(max(self.sizeHint().width(), self.minimumWidth()), 720)
-        h = min(max(self.sizeHint().height(), self.minimumHeight()), 520)
+        p = self.parentWidget()
+        w = min(max(self.sizeHint().width(), self.minimumWidth()),
+                720 if p is None else p.width())
+        h = min(max(self.sizeHint().height(), self.minimumHeight()),
+                520 if p is None else p.height())
         self.resize(w, h)
         self.reanchor()
 
@@ -328,13 +345,43 @@ class DetailWindow(QWidget):
             return self.pos()
         return t.mapToGlobal(self._anchor_local())
 
+    def _clamp_inside(self, x: int, y: int) -> QPoint:
+        """把視窗夾在主視窗範圍內。"""
+        p = self.parentWidget()
+        if p is None:
+            return QPoint(x, y)
+        r = QRect(p.mapToGlobal(QPoint(0, 0)), p.size())
+        x = max(r.left(), min(x, r.right() - self.width() + 1))
+        y = max(r.top(), min(y, r.bottom() - self.height() + 1))
+        return QPoint(x, y)
+
     def reanchor(self) -> None:
         """依目前目標重新定位，保持右下角對齊與使用者的拖曳偏移。"""
+        if getattr(self, "_busy_anchor", False):
+            return
         t = getattr(self, "_target", None)
         if t is None or not self.isVisible():
             return
-        g = self._anchor_global()
-        self.move(g.x() + self._offset.x(), g.y() + self._offset.y())
+        # re-entrancy：_fit_to_parent 可能觸發 resize，而 resize 會再
+        # 呼叫這裡；不設旗標會無窮遞迴。
+        self._busy_anchor = True
+        try:
+            # 主視窗可能已縮小，尺寸上限要跟著更新，否則視窗會大到
+            # 超出主視窗而找不回來。
+            self._fit_to_parent()
+            g = self._anchor_global()
+            pos = self._clamp_inside(g.x() + self._offset.x(),
+                                     g.y() + self._offset.y())
+            self.move(pos)
+        finally:
+            self._busy_anchor = False
+        # 主視窗被點選或重繪後，浮動視窗可能被蓋到後面，這裡補一次置前
+        self.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # 使用者把視窗拉大超出主視窗時，立刻夾回範圍內
+        self.reanchor()
 
     def drag_begin(self, pos) -> None:
         p = pos.toPoint() if hasattr(pos, "toPoint") else pos

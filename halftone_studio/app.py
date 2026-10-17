@@ -12,7 +12,7 @@ import sys
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QEvent, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QImage, QPainter, QPen, QPixmap,
 )
@@ -44,9 +44,22 @@ APP_TITLE = "絲網印刷半調網點 Halftone Studio"
 PANEL_MIN_WIDTH = 360
 PANEL_MAX_WIDTH = 420
 
+# 總覽區的最小尺寸（置合模式使用）
+MIN_VIEW_W = 320
+MIN_VIEW_H = 240
+
 
 class ImageView(QLabel):
-    """支援縮放與捲動的影像顯示區。"""
+    """支援縮放與捲動的影像顯示區。
+
+    影像由 paintEvent 自己繪製，不交給 QLabel 畫。原因是 QLabel 在
+    圖片大於控件時會**自行再縮放一次**，而 self.pixmap() 回傳的仍是
+    縮放前的原圖 —— 畫面位置、框線位置與點擊換算於是各用各的座標，
+    三者對不上。實測框線明顯偏移。
+
+    現在統一由 _drawn（影像在控件內的實際矩形）這一個來源換算，
+    繪製、框線、點擊三者必然一致。
+    """
 
     # 使用者在總覽圖上點擊（影像座標）
     crop_clicked = Signal(int, int)
@@ -57,11 +70,13 @@ class ImageView(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(320, 240)
         self._pixmap: QPixmap | None = None
+        self._scaled: QPixmap | None = None
         self._crop: tuple[int, int, int, int] | None = None
-        self._shown_scale = 1.0
         self._full_size: tuple[int, int] | None = None
         self._zoom = 1.0
         self._fit = True
+        # 影像實際繪製在控件內的矩形：座標換算的唯一依據
+        self._drawn = QRect()
 
     def set_image(self, array: np.ndarray) -> None:
         img = QImage(array.data, array.shape[1], array.shape[0],
@@ -69,6 +84,7 @@ class ImageView(QLabel):
         # 保持記憶體有效，QImage 不會自行複製
         img = img.copy()
         self._pixmap = QPixmap.fromImage(img)
+        self.setText("")
         self.update_view()
 
     def set_rgb(self, array: np.ndarray) -> None:
@@ -77,12 +93,15 @@ class ImageView(QLabel):
         img = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
                      rgb.strides[0], QImage.Format_RGB888).copy()
         self._pixmap = QPixmap.fromImage(img)
+        self.setText("")
         self.update_view()
 
     def clear_image(self) -> None:
         self._pixmap = None
-        self.clear()
-        self.update_view()
+        self._scaled = None
+        self._drawn = QRect()
+        self.setText("尚未載入影像\n\n請點選「開啟 JPG」開始")
+        self.update()
 
     def set_zoom(self, zoom: float) -> None:
         self._zoom = max(0.05, min(16.0, zoom))
@@ -100,32 +119,59 @@ class ImageView(QLabel):
         self.set_zoom(self._zoom * factor)
 
     def update_view(self) -> None:
-        if self._pixmap is None:
-            self.setText("尚未載入影像\n\n請點選「開啟 JPG」開始")
-            return
-        if self._fit:
-            m = self.contentsMargins()
-            avail_w = max(1, self.width() - m.left() - m.right())
-            avail_h = max(1, self.height() - m.top() - m.bottom())
-            w, h = self._pixmap.width(), self._pixmap.height()
-            s = min(avail_w / w, avail_h / h)
-            target = self._pixmap.scaled(
-                max(1, int(w * s)), max(1, int(h * s)),
-                Qt.KeepAspectRatio, Qt.FastTransformation)
-            self.setPixmap(target)
-            # 記錄實際顯示比例，供裁切指示框換算座標
-            self._shown_scale = target.width() / w if w else 1.0
-            self.update()
-            return
-        w = int(self._pixmap.width() * self._zoom)
-        h = int(self._pixmap.height() * self._zoom)
-        target = self._pixmap.scaled(
-            max(1, w), max(1, h),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.setPixmap(target)
-        self._shown_scale = target.width() / self._pixmap.width() \
-            if self._pixmap.width() else 1.0
+        self._scaled = None
+        self._recompute()
         self.update()
+
+    def _recompute(self) -> None:
+        """算出影像在控件內的實際矩形，並預先縮放。"""
+        if self._pixmap is None:
+            self._drawn = QRect()
+            self._sync_minimum(0, 0)
+            return
+
+        m = self.contentsMargins()
+        avail_w = max(1, self.width() - m.left() - m.right())
+        avail_h = max(1, self.height() - m.top() - m.bottom())
+        sw, sh = self._pixmap.width(), self._pixmap.height()
+        if sw <= 0 or sh <= 0:
+            self._drawn = QRect()
+            self._sync_minimum(0, 0)
+            return
+
+        if self._fit:
+            s = min(avail_w / sw, avail_h / sh)
+            dw = max(1, min(avail_w, int(round(sw * s))))
+            dh = max(1, min(avail_h, int(round(sh * s))))
+        else:
+            # 放大時不可夾在可視區內，否則放大按鈕會完全沒有作用。
+            # 讓控件本身長到影像那麼大，外層 QScrollArea 就會出現捲軸。
+            s = self._zoom
+            dw = max(1, int(round(sw * s)))
+            dh = max(1, int(round(sh * s)))
+
+        self._drawn = QRect(m.left() + (avail_w - dw) // 2,
+                            m.top() + (avail_h - dh) // 2, dw, dh)
+
+        mode = (Qt.SmoothTransformation if s >= 1.0
+                else Qt.FastTransformation)
+        self._scaled = self._pixmap.scaled(dw, dh, Qt.IgnoreAspectRatio,
+                                           mode)
+        self._sync_minimum(dw, dh)
+
+    def _sync_minimum(self, dw: int, dh: int) -> None:
+        """讓 QScrollArea 知道實際需要多大捲動範圍。"""
+        m = self.contentsMargins()
+        if dw <= 0 or dh <= 0:
+            want = QSize(MIN_VIEW_W, MIN_VIEW_H)
+        elif self._fit:
+            want = QSize(MIN_VIEW_W, MIN_VIEW_H)
+        else:
+            want = QSize(dw + m.left() + m.right(),
+                         dh + m.top() + m.bottom())
+        if self.minimumSize() != want:
+            self.setMinimumSize(want)
+            self.updateGeometry()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -141,62 +187,59 @@ class ImageView(QLabel):
     def crop_to_image(self, px: int, py: int) -> tuple[int, int] | None:
         """把視窗座標換算回「整張原圖」座標。
 
-        總覽顯示的是縮圖，但裁切框與細節窗格都使用全解析度座標。
+        總覽顯示的是縮圖，但裁切框與細節視窗都使用全解析度座標。
         兩者比例不同，若直接把縮圖座標當全解析度座標使用，
         24MP 影像會有 23% 以上的定位誤差。
         """
-        if self._pixmap is None:
+        if self._pixmap is None or self._drawn.isEmpty():
             return None
-        s = self._shown_scale
-        if s <= 0:
+        # 點在影像外的空白處不處理
+        if not self._drawn.contains(px, py):
             return None
 
-        # 視窗 -> 顯示中的縮圖
-        off = self._pixmap_offset()
-        disp_x = (px - off[0]) / s
-        disp_y = (py - off[1]) / s
-
-        # 縮圖 -> 整張原圖
-        dw, dh = self._pixmap.width(), self._pixmap.height()
-        if not self._full_size or not dw or not dh:
-            return (int(disp_x), int(disp_y))
-        fw, fh = self._full_size
-        return (int(disp_x * fw / dw), int(disp_y * fh / dh))
+        fw, fh = self._full_size or (self._pixmap.width(),
+                                     self._pixmap.height())
+        ix = int((px - self._drawn.left()) / self._drawn.width() * fw)
+        iy = int((py - self._drawn.top()) / self._drawn.height() * fh)
+        return (max(0, min(fw - 1, ix)), max(0, min(fh - 1, iy)))
 
     def set_full_size(self, width: int, height: int) -> None:
         """告知總覽所顯示的縮圖對應的原圖尺寸。"""
         self._full_size = (width, height)
 
-    def _pixmap_offset(self) -> tuple[int, int]:
-        if self._pixmap is None:
-            return (0, 0)
-        pm = self.pixmap()
-        if pm is None:
-            return (0, 0)
-        return ((self.width() - pm.width()) // 2,
-                (self.height() - pm.height()) // 2)
+    def drawn_rect(self) -> QRect:
+        return QRect(self._drawn)
 
     def paintEvent(self, event) -> None:  # noqa: N802
+        # super() 只負責畫樣式表的框線與底色；QLabel 本身沒有 pixmap
+        # 與文字，所以不會畫出多餘的東西。
         super().paintEvent(event)
-        if self._crop is None or self._pixmap is None:
+
+        if self._pixmap is None or self._scaled is None \
+                or self._drawn.isEmpty():
             return
-        x, y, w, h = self._crop
-        s = self._shown_scale
-        if s <= 0:
-            return
-        off = self._pixmap_offset()
 
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setPen(QPen(QColor(255, 90, 150), 2))
-        p.setBrush(QBrush(QColor(255, 120, 175, 40)))
-        p.drawRect(QRectF(off[0] + x * s, off[1] + y * s,
-                          w * s, h * s))
+        p.drawPixmap(self._drawn.topLeft(), self._scaled)
+
+        if self._crop is not None:
+            # 裁切框在全解析度座標，須換成顯示矩形內的相對位置
+            x, y, w, h = self._crop
+            fw, fh = self._full_size or (self._pixmap.width(),
+                                         self._pixmap.height())
+            dx = self._drawn.left() + x / fw * self._drawn.width()
+            dy = self._drawn.top() + y / fh * self._drawn.height()
+            dw = w / fw * self._drawn.width()
+            dh = h / fh * self._drawn.height()
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setPen(QPen(QColor(255, 90, 150), 2))
+            p.setBrush(QBrush(QColor(255, 120, 175, 40)))
+            p.drawRect(QRectF(dx, dy, dw, dh))
         p.end()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        pos = self.crop_to_image(event.position().x(),
-                                 event.position().y())
+        pos = self.crop_to_image(int(event.position().x()),
+                                 int(event.position().y()))
         if pos is not None:
             self.crop_clicked.emit(pos[0], pos[1])
             event.accept()
@@ -298,8 +341,9 @@ class MainWindow(QMainWindow):
         self.detail.crop_changed.connect(self._on_crop_changed)
         self.view.crop_clicked.connect(self.detail.move_crop)
 
-        self.detail_win = DetailWindow(self.detail)
+        self.detail_win = DetailWindow(self.detail, parent=self)
         self.detail_win.title.installEventFilter(self)
+        self.view.installEventFilter(self)
         self.detail_win.closeEvent = self._on_detail_close
 
         top = QWidget()
@@ -719,22 +763,40 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        dw = getattr(self, "detail_win", None)
+        if dw is None:
+            return super().eventFilter(obj, event)
+
+        # 主預覽區被拉伸（例如拖曳分隔線）時，右下角跟著動。
+        # 主視窗本身不會觸發 resizeEvent，所以要另外掛在預覽上。
+        if obj is self.view and event.type() == QEvent.Resize:
+            dw.reanchor()
+            return False
+
         # 浮動視窗標題列：按左鍵拖曳即可移動
-        win = getattr(self, "detail_win", None)
-        if win is not None and obj is win.title:
+        if obj is dw.title:
             et = event.type()
             if et == QEvent.MouseButtonPress and \
                     event.button() == Qt.LeftButton:
-                self.detail_win.drag_begin(event.globalPosition())
+                dw.drag_begin(event.globalPosition())
                 return True
             if et == QEvent.MouseMove and \
                     (event.buttons() & Qt.LeftButton):
-                self.detail_win.drag_move(event.globalPosition())
+                dw.drag_move(event.globalPosition())
                 return True
             if et == QEvent.MouseButtonRelease:
-                self.detail_win.drag_end()
+                dw.drag_end()
                 return True
         return super().eventFilter(obj, event)
+
+    def event(self, e) -> bool:  # noqa: N802
+        # 主視窗被點選而提到最前面時，Windows 可能把浮動視窗壓到後面，
+        # 這裡在啟用時補一次置前。
+        if e.type() == QEvent.WindowActivate:
+            dw = getattr(self, "detail_win", None)
+            if dw is not None and dw.isVisible():
+                dw.raise_()
+        return super().event(e)
 
     def toggle_detail(self, checked: bool) -> None:  # noqa: N802
         if checked:
