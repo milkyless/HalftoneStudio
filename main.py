@@ -8,40 +8,62 @@
 """
 from __future__ import annotations
 
+import glob
 import os
-import subprocess
+import shutil
 import sys
+import tempfile
+import time
 import traceback
 
+# 早於這個時間的 _MEI 目錄才視為殘留。
+#
+# PyInstaller 單檔 exe 會解壓到 %TEMP%\_MEIxxxxxx（約 149 MB）。
+# 正常關閉時 bootloader 會自行刪除；只有被工作管理員強制結束時才會
+# 留下垃圾。
+#
+# 取 24 小時是為了絕對安全：使用者可能同時開著另一個實例，那個
+# 目錄一定不到 24 小時，不會被誤刪。
+STALE_MEI_AGE = 24 * 3600
 
-def _schedule_meipass_cleanup() -> None:
-    """打包成單檔 exe 時，退出後清掉解壓出來的暫存目錄。
 
-    PyInstaller 會把執行檔解壓到 %TEMP%\\_MEIxxxxxx（約 149 MB）。
-    正常關閉時 bootloader 有時不會把它刪掉，反覆執行會不斷累積。
+def purge_stale_meipass(age_seconds: float = STALE_MEI_AGE,
+                        temp_dir: str | None = None) -> list[str]:
+    """清掉先前殘留的 _MEI 解壓目錄，回傳實際刪除的路徑。
 
-    我們自己仍持有該目錄內 DLL 的檔案句柄，直接刪除會失敗，
-    因此啟動一個隱藏的輔助行程，等本行程結束後再刪除。
-    失敗也不影響功能。
+    早期實作是在退出時啟動 `cmd /c "ping -n 4 127.0.0.1 & rmdir ..."`
+    等本行程結束再刪。兩個問題：
+
+      1. `ping` 是在本機回送地址，不是對外連線，但使用者在畫面上
+         會看到黑色終端視窗不斷回應封包，誤以為程式在連網。
+      2. `CREATE_NO_WINDOW` 與 `DETACHED_PROCESS` 互相衝突
+         （MSDN 明確註明兩者不可併用），視窗仍會被開出來。
+
+    改成啟動時清理，就不需要任何子行程，自然也不會有終端視窗。
+    只刪「已經很舊且刪得掉」的目錄；刪不掉（仍被某個實例佔用）
+    就安靜略過，任何失敗都不影響程式啟動。
     """
-    meipass = getattr(sys, "_MEIPASS", None)
-    if not meipass or not os.path.isdir(meipass):
-        return
+    removed: list[str] = []
 
-    # 必須在 PyInstaller 判定的「凍結」狀態才需要處理
-    if not getattr(sys, "frozen", False):
-        return
+    # 本行程正在使用的目錄，絕不能碰
+    mine = getattr(sys, "_MEIPASS", None)
 
-    script = (
-        'ping -n 4 127.0.0.1 >nul & rmdir /s /q "{d}"'
-    ).format(d=meipass)
-    flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
-             | getattr(subprocess, "DETACHED_PROCESS", 0))
-    try:
-        subprocess.Popen(["cmd", "/c", script], creationflags=flags,
-                         close_fds=True)
-    except Exception:  # noqa: BLE001
-        pass
+    root = temp_dir or tempfile.gettempdir()
+    now = time.time()
+    for path in glob.glob(os.path.join(root, "_MEI*")):
+        try:
+            if not os.path.isdir(path) or os.path.islink(path):
+                continue
+            if mine and os.path.abspath(path) == os.path.abspath(mine):
+                continue
+            if now - os.path.getmtime(path) < age_seconds:
+                continue
+            shutil.rmtree(path)
+            removed.append(path)
+        except OSError:
+            # 仍被占用或權限不足，略過即可
+            continue
+    return removed
 
 
 def _report_fatal(exc: BaseException) -> None:
@@ -195,7 +217,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    _schedule_meipass_cleanup()
+    # 清理先前殘留的解壓目錄。不啟動任何子行程，因此不會出現
+    # 黑色終端視窗。
+    try:
+        purge_stale_meipass()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         sys.exit(main())
     except SystemExit:

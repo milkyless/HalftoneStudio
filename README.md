@@ -176,6 +176,42 @@ python -m venv .venv
 
 ---
 
+## 完全離線，不會彈出終端視窗
+
+程式**沒有任何網路功能**：原始碼不含 `socket` / `urllib` / `requests` / `http`，
+執行檔的 PE 子系統為 `WINDOWS_GUI`（結構上就不附帶主控台），
+實測啟動與執行期間 TCP 連線為 **0 筆**。
+
+早期版本為了清除 `%TEMP%\_MEIxxxxx` 暫存目錄，在啟動時執行
+
+```
+cmd /c "ping -n 4 127.0.0.1 >nul & rmdir /s /q <_MEIPASS>"
+```
+
+那個 ping 打的是**本機回送位址**，封包不會離開電腦，但使用者的畫面上
+會跳出黑色終端視窗並看到連續回應，極易誤以為程式在連網。
+加上 `CREATE_NO_WINDOW` 與 `DETACHED_PROCESS` 互相衝突（MSDN 註明
+兩者不可併用），視窗仍會被開出來。
+
+現在改為**啟動時自行清理**（`main.purge_stale_meipass()`）：
+
+- 不啟動任何子行程，自然沒有終端視窗
+- 只刪除**超過 24 小時**且刪得掉的 `_MEI*` 目錄；使用者若同時開著
+  另一個實例，其目錄必然不到 24 小時，不會被誤刪
+- 刪不掉（仍被占用）就安靜略過，任何失敗都不影響啟動
+- 本行程自己的 `_MEIPASS` 絕不碰
+
+正常關閉時 bootloader 本來就會自行清除，實測點擊 X 後 **0.1 秒**退出、
+殘留行程 0、暫存目錄歸零；強制結束留下的垃圾，下一次啟動就會回收。
+
+驗證方式：
+
+```powershell
+.venv\Scripts\python.exe tests\check_mei.py
+```
+
+---
+
 ## 演算法原理
 
 採用 **AM（振幅調變）網屏**模型：先計算每個像素到最近網點中心的「形狀距離」，
@@ -214,7 +250,8 @@ tests/
   test_core.py     演算法測試（17 項）
   check_1bit.py    1-bit PNG 驗證
   check_crop_xy.py 點擊座標換算驗證
-  check_detail_ui.py 浮動視窗、錨定、匯出不凍結（28 項）
+  check_detail_ui.py 浮動視窗、錨定、匯出不凍結
+  check_mei.py     暫存目錄自清理、無子行程（無黑窗）
   check_meta.py    中繼資料抹除驗證
   check_preview.py 預覽與產出一致性
   check_tiling.py  無平鋪接縫驗證
