@@ -62,17 +62,18 @@ def main() -> int:
 
     def mk(resolution: float) -> HalftoneParams:
         return HalftoneParams(
-            resolution=resolution, frequency=params.frequency,
+            print_width_mm=params.print_width_mm, resolution=resolution,
+            frequency=params.frequency,
             stochastic=params.stochastic, angle=params.angle,
             dot_shape=params.dot_shape, shape_amount=params.shape_amount,
-            grain_scale=params.grain_scale, noise_size=params.noise_size,
-            dot_gain=params.dot_gain, min_dot=params.min_dot,
-            max_dot=params.max_dot, seed=params.seed)
+            noise_size=params.noise_size,
+            dot_gain=params.dot_gain, min_ink=params.min_ink,
+            max_ink=params.max_ink, seed=params.seed)
 
+    # 预览用缩图：dpi 必须按缩图实际宽度推导（UI 现在就是这么做的），
+    # 否则网点相对整张图会被放大数倍。
     wrong_out = halftone(small, mk(params.resolution))
-    # 与实际 UI 相同：先按比例缩小，再保证网格不小于 3 px
-    res_fixed = max(params.resolution * scale,
-                    3.0 * params.frequency)
+    res_fixed = params.resolution * scale
     fixed_out = halftone(small, mk(res_fixed))
 
     def cell_of(result: np.ndarray) -> float:

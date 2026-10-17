@@ -76,7 +76,7 @@ def generate_blue_noise(size: int = 64, seed: int = 0) -> np.ndarray:
     used = np.zeros(n, dtype=bool)
     k = 0
 
-    # ── 階段一：挖空（移除最孤立的網點）────────────────────────
+    # ── 階段一：挖空（移除最孤立的墨點）────────────────────────
     dist = _distance_field(~binary)
     since = 0
 

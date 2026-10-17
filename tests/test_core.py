@@ -16,14 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from halftone_studio.blue_noise import generate_blue_noise  # noqa: E402
 from halftone_studio.core import (  # noqa: E402
-    DOT_ORGANIC, DOT_ROUND, DOT_SQUARE, HalftoneParams, halftone,
-    to_grayscale,
+    DOT_CROSS, DOT_ORGANIC, DOT_ROUND, DOT_SQUARE, HalftoneParams, halftone,
+    physical_metrics, to_grayscale,
 )
 
 
 def _flat(**kw) -> HalftoneParams:
     """不含夾限與擴大的參數，便於檢驗密度還原。"""
-    base = dict(min_dot=0.0, max_dot=1.0, dot_gain=0.0)
+    base = dict(min_ink=0.0, max_ink=1.0, dot_gain=0.0)
     base.update(kw)
     return HalftoneParams(**base)
 
@@ -149,12 +149,92 @@ def test_organic_shape_is_distinct():
     assert _difference(rnd, org) > 5.0
 
 
-def test_grain_scale_affects_size():
-    """顆粒粗細必須實際改變輸出。"""
+def test_frequency_affects_dot_size():
+    """網屏線數必須實際改變輸出（舊版的「顆粒粗細」已併入此項）。"""
     img = np.full((200, 200), 0.5, dtype=np.float32)
     ref = halftone(img, _flat())
-    big = halftone(img, _flat(grain_scale=3.0))
-    assert _difference(ref, big) > 10.0
+    fine = halftone(img, _flat(frequency=80.0))
+    assert _difference(ref, fine) > 10.0
+
+
+def test_cross_shape_is_distinct():
+    """十字架形狀必須明顯不同於圓形與方形。"""
+    img = np.full((200, 200), 0.5, dtype=np.float32)
+    rnd = halftone(img, _flat(dot_shape=DOT_ROUND))
+    cross = halftone(img, _flat(dot_shape=DOT_CROSS))
+    assert _difference(rnd, cross) > 5.0
+
+
+def test_cross_corners_stay_white():
+    """十字架的四角必須留白；方形則填滿整格。
+
+    直接檢驗距離場：對同一門檻，方形的墨區會填滿其外接矩形
+    （密度 1.0），十字架則因四角留白而低於 1.0。這是兩者最根本的
+    差異，比比較上墨率可靠（上墨率本來就被歸一化成一樣）。
+    """
+    from halftone_studio.core import _dot_metric
+
+    cell = 40
+    p = HalftoneParams(dot_shape=DOT_CROSS, stochastic=1.0, angle=0.0,
+                       frequency=1000.0 / cell, resolution=1000.0)
+    d_cross = _dot_metric(p, cell, 0, cell, cell)
+    p2 = HalftoneParams(dot_shape=DOT_SQUARE, stochastic=1.0, angle=0.0,
+                        frequency=1000.0 / cell, resolution=1000.0)
+    d_square = _dot_metric(p2, cell, 0, cell, cell)
+
+    thr = np.percentile(d_cross, 30.0)
+    mask = d_cross <= thr
+    ys, xs = np.nonzero(mask)
+    assert xs.size > 0
+    sub = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    cross_fill = float(sub.mean())
+
+    thr2 = np.percentile(d_square, 30.0)
+    mask2 = d_square <= thr2
+    ys2, xs2 = np.nonzero(mask2)
+    sub2 = mask2[ys2.min():ys2.max() + 1, xs2.min():xs2.max() + 1]
+    square_fill = float(sub2.mean())
+
+    assert square_fill > 0.999, f"方形外接矩形應填滿，實測 {square_fill:.3f}"
+    assert cross_fill < 0.80, f"十字架四角應留白，實測填滿度 {cross_fill:.3f}"
+
+
+def test_ink_range_semantics():
+    """min_ink 決定最淡墨點，max_ink 決定最濃墨點，名實必須相符。"""
+    img = np.concatenate([np.full((160, 160), 1.0, np.float32),
+                          np.zeros((160, 160), np.float32)], axis=1)
+    # 完全放開：純白無墨、純黑實心
+    r = halftone(img, _flat(dot_gain=0.0))
+    assert float((r[:, :160] == 0).mean()) == 0.0, "純白區不該有墨"
+    assert float((r[:, 160:] == 0).mean()) > 0.97, "純黑區應近實心"
+
+    # 下限提高 -> 高光開始出現墨點
+    r = halftone(img, _flat(dot_gain=0.0, min_ink=0.20))
+    assert 0.18 < float((r[:, :160] == 0).mean()) < 0.22
+
+    # 上限降低 -> 暗部不再實心
+    r = halftone(img, _flat(dot_gain=0.0, max_ink=0.70))
+    assert 0.68 < float((r[:, 160:] == 0).mean()) < 0.72
+
+
+def test_physical_metrics():
+    """實體數值推算：印刷寬度決定 dpi，lpi 決定間距。"""
+    p = HalftoneParams(print_width_mm=152.4, frequency=40.0,
+                       resolution=4500.0 / 6.0)
+    m = physical_metrics(p)
+    assert abs(m["dpi"] - 750.0) < 1.0
+    assert abs(m["pitch_mm"] - 25.4 / 40.0) < 1e-6
+    # 圓形墨點 50% 覆蓋率 -> 直徑 = 2 * 間距 * sqrt(0.5/pi)
+    import math
+    want = 2.0 * m["pitch_mm"] * math.sqrt(0.5 / math.pi)
+    assert abs(m["mid_mm"] - want) < 1e-9
+
+    # 印刷寬度加倍（圖片不變）-> dpi 減半，墨點像素尺寸跟著減半
+    p2 = HalftoneParams(print_width_mm=304.8, frequency=40.0,
+                        resolution=4500.0 / 12.0)
+    m2 = physical_metrics(p2)
+    assert abs(m2["pitch_mm"] - m["pitch_mm"]) < 1e-9      # 物理間距不變
+    assert m2["mid_px"] < m["mid_px"]                     # 但像素變小
 
 
 def test_stochastic_changes_structure():
@@ -194,8 +274,8 @@ def test_invalid_params_rejected():
     """非法參數必須被拒絕。"""
     img = np.full((64, 64), 0.5, dtype=np.float32)
     for kw in (dict(frequency=0.0), dict(stochastic=1.5),
-               dict(min_dot=0.9, max_dot=0.1), dict(dot_shape=99),
-               dict(noise_size=4)):
+               dict(min_ink=0.9, max_ink=0.1), dict(dot_shape=99),
+               dict(noise_size=4), dict(print_width_mm=0.0)):
         try:
             halftone(img, HalftoneParams(**kw))
         except ValueError:

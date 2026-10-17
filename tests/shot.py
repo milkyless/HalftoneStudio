@@ -37,7 +37,7 @@ rgb = np.clip(rgb - dark, 0, 255)
 gray = (rgb @ np.array([0.299, 0.587, 0.114])).astype(np.uint8)
 
 win = MainWindow()
-win.resize(1600, 950)
+win.resize(1700, 1000)
 win.show()
 
 small = np.asarray(Image.fromarray(gray).resize(
@@ -48,6 +48,7 @@ win._preview_scale = small.shape[1] / W
 win.view.set_full_size(W, H)
 win.view.set_rgb(win._rgb)
 win.view.fit()
+win._refresh_readout()
 win.detail.set_gray(gray)
 win.act_detail.setChecked(False)
 win.act_detail.setChecked(True)
@@ -55,7 +56,7 @@ app.processEvents()
 
 # 走真實路徑算一次預覽與細節，否則畫面會是「尚未載入影像」
 win.controller.set_gray(small)
-win.controller.request(win._params(for_preview=True))
+win.controller.request(win._params(small.shape[1]))
 win._apply_detail()
 
 deadline = time.time() + 120

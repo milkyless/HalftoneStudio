@@ -1,4 +1,4 @@
-"""絲網印刷半調網點 — 桌面應用程式主視窗。
+"""絲網印刷半調墨點 — 桌面應用程式主視窗。
 
 設計原則：
   - 所有運算交給背景執行緒，介面永不因大圖而凍結
@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from .core import (
-    DOT_SHAPES, HalftoneParams, halftone,
+    DOT_SHAPES, HalftoneParams, halftone, physical_metrics,
 )
 from .detail import DetailPane, DetailWindow
 from .image_io import (
@@ -33,11 +33,11 @@ from .image_io import (
 from .icons import app_icon
 from .preview import ExportController, PreviewController
 from .theme import get_stylesheet
-from .widgets import SliderSpin, add_row, build_group
+from .widgets import InkRange, SliderSpin, add_row, build_group
 
 __all__ = ["MainWindow", "main"]
 
-APP_TITLE = "絲網印刷半調網點 Halftone Studio"
+APP_TITLE = "絲網印刷半調墨點 Halftone Studio"
 
 # 控制面板的寬度範圍。設定上下限可避免面板被拉伸得過寬，
 # 或在視窗較窄時被擠壓而顯示不全。
@@ -335,7 +335,7 @@ class MainWindow(QMainWindow):
 
         # ── 細節放大視窗 ──────────────────────────────────
         # 以全解析度計算指定區域，結果與匯出檔案逐像素相同，
-        # 可真正檢視網點細節。做成浮動視窗疊在主預覽右下角，
+        # 可真正檢視墨點細節。做成浮動視窗疊在主預覽右下角，
         # 不佔固定版面；可拖曳移動、往左上拉大、或直接關閉。
         self.detail = DetailPane()
         self.detail.crop_changed.connect(self._on_crop_changed)
@@ -385,51 +385,82 @@ class MainWindow(QMainWindow):
         add_row(fl, "輸出", self.btn_export)
         layout.addWidget(files)
 
-        # 網點
-        dots, dl = build_group("網點")
+        # 墨點
+        dots, dl = build_group("墨點")
         self.cmb_shape = QComboBox()
         self.cmb_shape.addItems(DOT_SHAPES)
         self.cmb_shape.currentIndexChanged.connect(self._on_changed)
-        add_row(dl, "網點形狀", self.cmb_shape)
+        add_row(dl, "墨點形狀", self.cmb_shape)
 
         self.sld_freq = SliderSpin(5.0, 200.0, 40.0, 1, 1.0, " lpi")
-        self.sld_res = SliderSpin(72.0, 1200.0, 300.0, 0, 10.0, " dpi")
         self.sld_angle = SliderSpin(0.0, 90.0, 45.0, 1, 1.0, " °")
-        for w, name in ((self.sld_freq, "網點頻率"),
-                        (self.sld_res, "解析度"),
+        for w, name in ((self.sld_freq, "網屏線數"),
                         (self.sld_angle, "網屏角度")):
             w.changed.connect(self._on_changed)
             add_row(dl, name, w)
         layout.addWidget(dots)
 
-        # 網點外觀
-        look, kl = build_group("網點外觀")
-        self.sld_stoch = SliderSpin(0.0, 1.0, 0.0, 2, 0.01, "")
-        self.sld_grain = SliderSpin(0.1, 8.0, 1.0, 2, 0.05, " ×")
+        # 印刷尺寸：決定 dpi，dpi 再與網屏線數一起決定墨點大小。
+        # 舊版把「解析度」直接放上面板，但它與網屏線數、顆粒粗細三者
+        # 只透過比值影響同一件事，而且面板顯示值與實際送進演算的值並不
+        # 相同。現在只填「印多寬」，解析度由畫面推導並只讀顯示。
+        size_box, sl = build_group("印刷尺寸")
+
+        self.cmb_unit = QComboBox()
+        self.cmb_unit.addItems(["mm", "寸"])
+        self.cmb_unit.currentIndexChanged.connect(self._on_unit_changed)
+
+        self.sld_width = SliderSpin(20.0, 1000.0, 152.4, 1, 1.0, " mm")
+        self.sld_width.changed.connect(self._on_width_changed)
+        self._width_mm_now = 152.4      # 真實毫米值快取
+        add_row(sl, "印刷寬度", self.sld_width)
+        add_row(sl, "單位", self.cmb_unit)
+
+        self.lbl_dpi = QLabel("—")
+        self.lbl_dpi.setObjectName("readoutValue")
+        add_row(sl, "實際解析度", self.lbl_dpi)
+
+        self.lbl_metrics = QLabel("—")
+        self.lbl_metrics.setObjectName("readoutValue")
+        self.lbl_metrics.setWordWrap(True)
+        add_row(sl, "墨點數值", self.lbl_metrics)
+        layout.addWidget(size_box)
+
+        # 墨點外觀
+        look, kl = build_group("墨點外觀")
+        # 占比以百分比顯示，與下方說明文字一致；內部再換算成 0~1
+        self.sld_stoch = SliderSpin(0.0, 100.0, 0.0, 0, 1.0, " %")
         self.sld_irreg = SliderSpin(0.0, 1.0, 0.0, 2, 0.01, "")
         self.sld_gain = SliderSpin(0.0, 0.6, 0.15, 2, 0.01, "")
-        for w, name in ((self.sld_stoch, "隨機網占比"),
-                        (self.sld_grain, "顆粒粗細"),
-                        (self.sld_irreg, "網點不規則"),
-                        (self.sld_gain, "網點擴大")):
+        for w, name in ((self.sld_stoch, "隨機墨點占比"),
+                        (self.sld_irreg, "墨點不規則"),
+                        (self.sld_gain, "墨點擴大")):
             w.changed.connect(self._on_changed)
             add_row(kl, name, w)
 
-        tip = QLabel("隨機網占比 0% = 隨機顆粒，100% = 傳統有序網點")
+        # 墨點大小範圍：取代舊版「最小墨點 / 最大墨點」。
+        # 舊版那兩個參數夾在亮度上，名稱與作用相反，預設值還會強迫
+        # 純白區印出 4.9% 墨量，高光因此出現一堆幾像素的碎點。
+        self.rng_ink = InkRange(0.0, 1.0)
+        self.rng_ink.changed.connect(self._on_changed)
+        add_row(kl, "墨點大小範圍", self.rng_ink)
+
+        tip = QLabel("墨點大小範圍：0 % = 紙白無點，100 % = 完全密實填充")
         tip.setWordWrap(True)
+        tip.setObjectName("hintText")
         kl.addWidget(tip)
+
+        tip2 = QLabel("隨機墨點占比 0% = 隨機顆粒，100% = 傳統有序墨點")
+        tip2.setWordWrap(True)
+        tip2.setObjectName("hintText")
+        kl.addWidget(tip2)
         layout.addWidget(look)
 
         # 印刷與隨機
         misc, ml = build_group("印刷與隨機")
-        self.sld_min = SliderSpin(0.0, 0.5, 0.03, 2, 0.01, "")
-        self.sld_max = SliderSpin(0.5, 1.0, 0.95, 2, 0.01, "")
         self.sld_noise = SliderSpin(8, 128, 64, 0, 4.0, " px")
-        for w, name in ((self.sld_min, "最小網點"),
-                        (self.sld_max, "最大網點"),
-                        (self.sld_noise, "藍雜訊尺寸")):
-            w.changed.connect(self._on_changed)
-            add_row(ml, name, w)
+        self.sld_noise.changed.connect(self._on_changed)
+        add_row(ml, "藍雜訊尺寸", self.sld_noise)
 
         seed_row = QWidget()
         seed_layout = QVBoxLayout(seed_row)
@@ -528,39 +559,126 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(has)
 
     # ── 參數 ──────────────────────────────────────────────
-    def _params(self, for_preview: bool = False) -> HalftoneParams:
+    MM_PER_INCH = 25.4
+
+    def _width_mm(self) -> float:
+        """目前輸入的印刷寬度，統一換算成 mm。"""
+        v = self.sld_width.value()
+        return v * self.MM_PER_INCH if self._unit_is_inch() else v
+
+    def _sync_width_cache(self) -> None:
+        """把「真實毫米值」寫進快取，供單位切換時使用。"""
+        self._width_mm_now = self._width_mm()
+
+    def _unit_is_inch(self) -> bool:
+        return self.cmb_unit.currentIndex() == 1
+
+    def _on_unit_changed(self, *_args) -> None:
+        """切換單位時換算顯示值，不改變實際寬度。
+
+        注意 currentIndexChanged 是在索引「已經換掉」之後才送出，
+        此時 _width_mm() 會用新單位去讀舊數值，算出來的結果是錯的
+        （152.4 mm 切到寸會變成 152.4 x 25.4）。因此改用 _width_mm_now
+        這個「目前單位下的真實毫米值」快取。
+        """
+        mm = self._width_mm_now
+        self._apply_unit_range()
+        shown = mm / self.MM_PER_INCH if self._unit_is_inch() else mm
+        self.sld_width.spin.blockSignals(True)
+        self.sld_width.spin.setValue(shown)
+        self.sld_width.spin.blockSignals(False)
+        self.sld_width.slider.blockSignals(True)
+        self.sld_width.slider.setValue(self.sld_width._to_slider(shown))
+        self.sld_width.slider.blockSignals(False)
+        self._refresh_readout()
+        self._on_changed()
+
+    def _apply_unit_range(self) -> None:
+        """調整輸入框的範圍與單位字樣。
+
+        setRange 會夾住當前值並送出 valueChanged，若不擋住訊號，
+        這個「夾制」會被當成使用者調整，寫壞毫米值快取。
+        """
+        self.sld_width.spin.blockSignals(True)
+        try:
+            if self._unit_is_inch():
+                self.sld_width.spin.setRange(0.8, 40.0)
+                self.sld_width.spin.setSingleStep(0.1)
+                self.sld_width.spin.setSuffix(" 寸")
+            else:
+                self.sld_width.spin.setRange(20.0, 1000.0)
+                self.sld_width.spin.setSingleStep(1.0)
+                self.sld_width.spin.setSuffix(" mm")
+        finally:
+            self.sld_width.spin.blockSignals(False)
+
+    def _on_width_changed(self, *_args) -> None:
+        self._sync_width_cache()
+        self._refresh_readout()
+        self._on_changed()
+
+    def _resolution_for(self, px_width: int) -> float:
+        """由「印多寬」與實際送去算的像素寬度推導 dpi。
+
+        px_width 必須是**真的會送去算的那個寬度**：
+          匯出與細節窗格 -> 原圖寬度
+          縮圖預覽       -> 縮圖寬度
+        舊版在 _params 裡靠 for_preview 旗標暗中縮放解析度，現在改成
+        由呼叫端明說要算多寬的影像，行為與面板顯示一致。
+        """
+        if px_width <= 0 or self._width_mm() <= 0:
+            return 300.0
+        return px_width / self._width_mm() * self.MM_PER_INCH
+
+    def _params(self, px_width: int | None = None) -> HalftoneParams:
         """組出參數。
 
-        for_preview=True 時會依預覽縮圖比例同步調整解析度。
-        網點尺寸是以像素計算的（解析度 ÷ 網點頻率），若圖片縮小
-        而解析度不變，網點相對整張圖會被放大數倍，預覽與實際產出
-        便完全對不上。這裡把解析度乘上縮圖比例，兩者尺度才一致。
+        px_width 為實際送去計算的像素寬度；未指定時用原圖寬度
+        （即匯出／細節窗格的設定）。
         """
-        resolution = self.sld_res.value()
-        if for_preview and self._preview_scale < 1.0:
-            # 網點尺寸 = 解析度 ÷ 頻率（單位是像素）。圖片縮小時若
-            # 解析度不變，網點相對整張圖會被放大數倍，預覽與實際
-            # 產出便完全對不上，因此要依縮圖比例同步縮小解析度。
-            resolution = resolution * self._preview_scale
-            # 但網點小於約 3 px 已接近取樣極限，再小只是雜訊。
-            # 此時維持 3 px，由「細節放大」窗格負責顯示真實網點。
-            resolution = max(resolution,
-                             3.0 * self.sld_freq.value())
-
+        if px_width is None:
+            px_width = (self._full_gray.shape[1]
+                        if self._full_gray is not None else 0)
+        lo, hi = self.rng_ink.values()
         return HalftoneParams(
-            resolution=resolution,
+            print_width_mm=self._width_mm(),
+            resolution=self._resolution_for(px_width),
             frequency=self.sld_freq.value(),
-            stochastic=self.sld_stoch.value(),
+            stochastic=self.sld_stoch.value() / 100.0,
             angle=self.sld_angle.value(),
             dot_shape=self.cmb_shape.currentIndex(),
             shape_amount=self.sld_irreg.value(),
-            grain_scale=self.sld_grain.value(),
             noise_size=int(self.sld_noise.value()),
             dot_gain=self.sld_gain.value(),
-            min_dot=self.sld_min.value(),
-            max_dot=self.sld_max.value(),
+            min_ink=lo,
+            max_ink=hi,
             seed=self._seed,
         )
+
+    def _refresh_readout(self) -> None:
+        """更新印刷尺寸區的只讀數值。"""
+        px_w = (self._full_gray.shape[1]
+                if self._full_gray is not None else 0)
+        if px_w <= 0:
+            self.lbl_dpi.setText("載入影像後顯示")
+            self.lbl_metrics.setText("載入影像後顯示")
+            return
+
+        params = self._params(px_w)
+        m = physical_metrics(params)
+
+        self.lbl_dpi.setText(f"{m['dpi']:.0f} dpi")
+
+        lines = [
+            f"間距　　{m['pitch_mm']:.3f} mm（{m['pitch_px']:.0f} px）",
+            f"中值墨點 {m['mid_mm']:.3f} mm（{m['mid_px']:.1f} px）",
+            f"最小墨點 {m['min_mm']:.3f} mm（{m['min_px']:.1f} px）",
+        ]
+        if params.min_ink > 0.0 and m["min_px"] < 1.5:
+            lines.append("⚠ 最小墨點不足 1.5 px，印不出來")
+        if m["pitch_px"] < 1.0:
+            lines.append("⚠ 網屏線數過高，已超出影像解析度")
+        self.lbl_metrics.setText("\n".join(lines))
 
     # ── 事件 ──────────────────────────────────────────────
     def _on_changed(self, *_args) -> None:
@@ -568,10 +686,13 @@ class MainWindow(QMainWindow):
         self._debounce.start()
 
     def _apply_preview(self) -> None:
+        # dpi 依賴影像像素寬度，載入影像後必須重算只讀數值
+        self._refresh_readout()
         if self._gray is None:
             return
-        # 預覽用縮圖，解析度需同步縮放，尺度才與實際產出一致
-        self.controller.request(self._params(for_preview=True))
+        # 預覽用縮圖：dpi 要依縮圖實際寬度推導，否則墨點相對整張圖
+        # 會被放大數倍，預覽與實際產出對不上。這裡明說送進去的是縮圖。
+        self.controller.request(self._params(self._gray.shape[1]))
         self._apply_detail()
 
     def _apply_detail(self) -> None:
@@ -583,23 +704,23 @@ class MainWindow(QMainWindow):
             return
         cx, cy = self.detail.crop_rect()[:2]
         fh, fw = self._full_gray.shape
-        # 傳入原圖座標與尺寸，網格才會與整圖完全對齊
-        self.detail_ctrl.request(self._params(), crop, (cx, cy), (fw, fh))
+        # 裁切區塊是原圖的一部分，像素尺度與原圖相同，所以用原圖寬度
+        self.detail_ctrl.request(self._params(fw), crop, (cx, cy), (fw, fh))
 
     def _on_preview(self, result: np.ndarray) -> None:
         self._result = result
-        self._mode = "網點預覽"
+        self._mode = "墨點預覽"
         self.view.set_image(result)
         self._update_compare()
 
     def on_toggle_compare(self) -> None:
-        """在原始彩色影像與網點預覽之間切換，用於對照。"""
+        """在原始彩色影像與墨點預覽之間切換，用於對照。"""
         if self._rgb is None:
             return
         if self._mode == "原圖":
             if self._result is not None:
                 self.view.set_image(self._result)
-                self._mode = "網點預覽"
+                self._mode = "墨點預覽"
         else:
             self.view.set_rgb(self._rgb)
             self._mode = "原圖"
@@ -611,7 +732,7 @@ class MainWindow(QMainWindow):
         if not has:
             return
         show_original = self._mode != "原圖"
-        self.btn_compare.setText("顯示原圖" if show_original else "顯示網點")
+        self.btn_compare.setText("顯示原圖" if show_original else "顯示墨點")
 
     def _on_error(self, message: str) -> None:
         self.progress.setVisible(False)
@@ -635,17 +756,27 @@ class MainWindow(QMainWindow):
     def on_reset_params(self) -> None:
         d = HalftoneParams()
         self.sld_freq.set_value(d.frequency)
-        self.sld_res.set_value(d.resolution)
         self.sld_angle.set_value(d.angle)
         self.cmb_shape.setCurrentIndex(d.dot_shape)
-        self.sld_stoch.set_value(d.stochastic)
-        self.sld_grain.set_value(d.grain_scale)
+        self.sld_stoch.set_value(d.stochastic * 100.0)
         self.sld_irreg.set_value(d.shape_amount)
         self.sld_gain.set_value(d.dot_gain)
-        self.sld_min.set_value(d.min_dot)
-        self.sld_max.set_value(d.max_dot)
+        self.rng_ink.set_values(d.min_ink, d.max_ink)
         self.sld_noise.set_value(d.noise_size)
+        # 印刷寬度預設六寸，切到寸時顯示值也要跟著換
+        if self._unit_is_inch():
+            shown = d.print_width_mm / self.MM_PER_INCH
+        else:
+            shown = d.print_width_mm
+        self.sld_width.spin.blockSignals(True)
+        self.sld_width.spin.setValue(shown)
+        self.sld_width.spin.blockSignals(False)
+        self.sld_width.slider.blockSignals(True)
+        self.sld_width.slider.setValue(self.sld_width._to_slider(shown))
+        self.sld_width.slider.blockSignals(False)
+        self._width_mm_now = d.print_width_mm
         self._seed = d.seed
+        self._refresh_readout()
         self._debounce.start()
 
     def on_open(self) -> None:
@@ -683,7 +814,7 @@ class MainWindow(QMainWindow):
         self._mode = "原圖"
 
         # 預覽縮圖的比例：預覽時解析度需依此比例同步縮小，
-        # 否則網點相對整張圖會被放大，預覽與實際產出便對不上。
+        # 否則墨點相對整張圖會被放大，預覽與實際產出便對不上。
         self._preview_scale = (self._gray.shape[1] / full.shape[1]
                                if full.shape[1] else 1.0)
 
@@ -734,11 +865,11 @@ class MainWindow(QMainWindow):
             path = f"{os.path.splitext(path)[0]}.png"
             fmt = "PNG"
 
-        # JPEG 為有損壓縮，二值網點邊緣會出現灰階雜訊，先行確認
+        # JPEG 為有損壓縮，二值墨點邊緣會出現灰階雜訊，先行確認
         if is_lossy_format(fmt):
             ok = QMessageBox.question(
                 self, "確認以 JPEG 輸出",
-                "JPEG 是有損壓縮格式，純黑白的網點邊緣在存檔後\n"
+                "JPEG 是有損壓縮格式，純黑白的墨點邊緣在存檔後\n"
                 "會出現灰階雜訊，可能影響製版品質。\n\n"
                 "程式會以最高畫質輸出以降低失真，但仍有殘留。\n"
                 "若要拿來實際製版，建議改用 PNG（無損）。\n\n"
@@ -805,7 +936,7 @@ class MainWindow(QMainWindow):
             f"已匯出 {path.rsplit(chr(92), 1)[-1]}"
             f"（{width}×{height}，上墨率 {ink:.1f}%）")
         bits = "1-bit 雙色" if fmt == "PNG" else "8 位元灰階"
-        note = ("\n\n注意：JPEG 為有損格式，網點邊緣可能有灰階雜訊。"
+        note = ("\n\n注意：JPEG 為有損格式，墨點邊緣可能有灰階雜訊。"
                 if is_lossy_format(fmt) else "")
         QMessageBox.information(
             self, "匯出完成",
@@ -824,9 +955,9 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "關於",
             f"<b>{APP_TITLE}</b><br><br>"
-            "絲網印刷用隨機顆粒半調網點工具。<br>"
-            "隨機網占比可連續調整：0% 為藍雜訊隨機顆粒，"
-            "100% 為傳統有序網點。<br><br>"
+            "絲網印刷用隨機顆粒半調墨點工具。<br>"
+            "隨機墨點占比可連續調整：0% 為藍雜訊隨機顆粒，"
+            "100% 為傳統有序墨點。<br><br>"
             "純 NumPy 實作，不依賴 GIMP 或其他外部影像軟體。")
 
     def _set_status(self, text: str) -> None:

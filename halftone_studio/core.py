@@ -1,11 +1,11 @@
-"""絲網印刷半調網點演算法核心。
+"""絲網印刷半調墨點演算法核心。
 
 設計要點（沿用 C 版經過驗證的邏輯）
   - 藍雜訊門檻場取代規則網格 → 顆粒位置自然隨機
   - 隨機網 / 有序網佔比連續可調 → 兩種質感之間無縫過渡
-  - 網點形狀可選（圓 / 方 / 橢圓）
-  - 網點不規則度：以角度諧波擾動網點邊界，避免死板幾何形
-  - 網點擴大補償與最小/最大網點夾限 → 對應網版印刷實務
+  - 墨點形狀可選（圓 / 方 / 橢圓）
+  - 墨點不規則度：以角度諧波擾動墨點邊界，避免死板幾何形
+  - 墨點擴大補償與最小/最大墨點夾限 → 對應網版印刷實務
 
 輸出為二值（黑墨白底），適用於實際製版。
 
@@ -21,66 +21,79 @@ import numpy as np
 from .blue_noise import generate_blue_noise
 
 __all__ = ["HalftoneParams", "halftone", "to_grayscale", "DOT_SHAPES",
-           "DOT_ROUND", "DOT_SQUARE", "DOT_ELLIPSE"]
+           "physical_metrics", "DOT_ROUND", "DOT_SQUARE", "DOT_CROSS"]
 
 
-# 網點形狀
+# 墨點形狀
 DOT_ROUND = 0
 DOT_SQUARE = 1
-DOT_ELLIPSE = 2
+DOT_CROSS = 2
 DOT_ORGANIC = 3
-DOT_SHAPES = ("圓形", "方形", "橢圓形", "隨機有機（銀鹽顆粒）")
+DOT_SHAPES = ("圓形", "方形", "十字架", "有機隨機（銀鹽顆粒）")
 
 
 @dataclass
 class HalftoneParams:
-    """半調網點參數。
+    """半調墨點參數。
 
-    stochastic 為「隨機網占比」：
+    stochastic 為「隨機墨點占比」：
         0.0 = 純隨機顆粒（藍雜訊分佈）
         1.0 = 傳統有序網格
+
+    min_ink / max_ink 為「墨點大小範圍」，量綱是墨點覆蓋面積比例：
+        0.0 = 紙白，完全沒有墨點
+        1.0 = 完全密實填充
+
+    注意：這兩個值直接以「墨量」表示。舊版的 min_dot / max_dot 夾在
+    亮度 t 上（t=1 為白），方向與名稱相反，最淡墨點其實由 max_dot
+    控制、高光碎點就是那樣來的。現在改以墨量為準，名實相符。
     """
 
-    resolution: float = 300.0      # 輸入解析度 dpi
-    frequency: float = 40.0        # 網點頻率 lpi
-    stochastic: float = 0.0        # 隨機網占比 0..1
-    angle: float = 45.0            # 網屏角度（度）
-    dot_shape: int = DOT_ROUND     # 網點形狀
-    shape_amount: float = 0.0      # 網點不規則度 0..1
-    grain_scale: float = 1.0       # 顆粒粗細倍率 0.1..8
-    noise_size: int = 64           # 藍雜訊尺寸
-    dot_gain: float = 0.15         # 網點擴大補償 0..0.6
-    min_dot: float = 0.03          # 最小網點 0..1
-    max_dot: float = 0.95          # 最大網點 0..1
-    seed: int = 0                  # 隨機種子
+    print_width_mm: float = 152.4     # 印刷寬度（mm，預設六寸）
+    frequency: float = 40.0          # 網屏線數 lpi
+    stochastic: float = 0.0          # 隨機墨點占比 0..1
+    angle: float = 45.0              # 網屏角度（度）
+    dot_shape: int = DOT_ROUND       # 墨點形狀
+    shape_amount: float = 0.0        # 墨點不規則度 0..1
+    noise_size: int = 64             # 藍雜訊尺寸
+    dot_gain: float = 0.15           # 墨點擴大補償 0..0.6
+    min_ink: float = 0.0             # 最小墨點覆蓋率 0..1
+    max_ink: float = 1.0             # 最大墨點覆蓋率 0..1
+    seed: int = 0                    # 隨機種子
+
+    # 內部推導量：由介面依實際送去算的像素寬度算出，不開放編輯。
+    # 舊版面板上有「解析度」滑桿，但它與「網屏線數」「顆粒粗細」
+    # 三者只透過比值影響同一件事，而且面板顯示的值與實際送進演算的
+    # 值並不相同（預覽時會暗中縮小）。現在改由「印刷寬度」推導。
+    resolution: float = 750.0        # 推導：每吋像素數 dpi
 
     def validate(self) -> list[str]:
         """回傳錯誤訊息清單，空清單代表合法。"""
         errors = []
-        if not (1.0 <= self.resolution <= 4800.0):
-            errors.append("解析度須介於 1 ~ 4800 dpi")
+        if not (1.0 <= self.print_width_mm <= 10000.0):
+            errors.append("印刷寬度須介於 1 ~ 10000 mm")
         if not (1.0 <= self.frequency <= 600.0):
-            errors.append("網點頻率須介於 1 ~ 600 lpi")
+            errors.append("網屏線數須介於 1 ~ 600 lpi")
         if not (0.0 <= self.stochastic <= 1.0):
-            errors.append("隨機網占比須介於 0% ~ 100%")
+            errors.append("隨機墨點占比須介於 0% ~ 100%")
         if not (0.0 <= self.angle <= 90.0):
             errors.append("網屏角度須介於 0 ~ 90 度")
         if not (0.0 <= self.shape_amount <= 1.0):
-            errors.append("網點不規則度須介於 0 ~ 1")
-        if not (0.1 <= self.grain_scale <= 8.0):
-            errors.append("顆粒粗細須介於 0.1 ~ 8.0")
+            errors.append("墨點不規則度須介於 0 ~ 1")
         if not (8 <= self.noise_size <= 128):
             errors.append("藍雜訊尺寸須介於 8 ~ 128")
         if not (0.0 <= self.dot_gain <= 0.6):
-            errors.append("網點擴大補償須介於 0 ~ 60%")
-        if not (0.0 <= self.min_dot <= 1.0):
-            errors.append("最小網點須介於 0 ~ 1")
-        if not (0.0 <= self.max_dot <= 1.0):
-            errors.append("最大網點須介於 0 ~ 1")
-        if self.min_dot > self.max_dot:
-            errors.append("最小網點不可大於最大網點")
+            errors.append("墨點擴大補償須介於 0 ~ 60%")
+        if not (0.0 <= self.min_ink <= 1.0):
+            errors.append("最小墨點覆蓋率須介於 0 ~ 100%")
+        if not (0.0 <= self.max_ink <= 1.0):
+            errors.append("最大墨點覆蓋率須介於 0 ~ 100%")
+        if self.min_ink > self.max_ink:
+            errors.append("最小墨點覆蓋率不可大於最大墨點覆蓋率")
         if not (0 <= self.dot_shape < len(DOT_SHAPES)):
-            errors.append("網點形狀設定無效")
+            errors.append("墨點形狀設定無效")
+        if self.resolution <= 0.0:
+            errors.append("解析度須為正值")
         if self.seed < 0:
             errors.append("隨機種子不可為負數")
         return errors
@@ -108,9 +121,9 @@ def to_grayscale(rgb: np.ndarray) -> np.ndarray:
 
 def _jitter_field(n_cells: int, noise_size: int, seed: int,
                   amp: float) -> tuple[np.ndarray, np.ndarray]:
-    """產生網點中心的隨機位移場（藍雜訊決定）。
+    """產生墨點中心的隨機位移場（藍雜訊決定）。
 
-    這是隨機篩的核心：位移量取自藍雜訊，因此網點雖然位置隨機，
+    這是隨機篩的核心：位移量取自藍雜訊，因此墨點雖然位置隨機，
     彼此間距卻保持均勻，不會出現成團或空隙。
 
     n_cells 為單一方向的網格數；回傳的場以 n_cells 為週期，
@@ -131,7 +144,7 @@ def _cell_rand(gi: np.ndarray, gj: np.ndarray, seed: int,
                channel: int) -> np.ndarray:
     """依網格座標產生固定的 0..1 亂數。
 
-    每顆網點都會得到不同的一組係數，因此每顆顆粒的輪廓都是
+    每顆墨點都會得到不同的一組係數，因此每顆顆粒的輪廓都是
     獨一無二的 —— 這正是膠片銀鹽顆粒的特徵，而不是重複的幾何圖形。
 
     全程使用 uint64 陣列運算：numpy 的陣列乘法會靜默回繞（符合
@@ -152,9 +165,9 @@ def _cell_rand(gi: np.ndarray, gj: np.ndarray, seed: int,
 def _organic_distort(dx: np.ndarray, dy: np.ndarray, dist: np.ndarray,
                      gi: np.ndarray, gj: np.ndarray, seed: int,
                      amp: float) -> np.ndarray:
-    """以每顆網點專屬的隨機諧波擾動輪廓，製造有機不規則顆粒。
+    """以每顆墨點專屬的隨機諧波擾動輪廓，製造有機不規則顆粒。
 
-    對每顆網點取不同的高階諧波係數，沿角度方向拉伸或壓縮距離場，
+    對每顆墨點取不同的高階諧波係數，沿角度方向拉伸或壓縮距離場，
     使輪廓成為有機的多瓣形，而非單調的圓或方。
 
     因為擾動是「每顆各自不同」，不會出現整張圖重複同一圖樣的呆板感。
@@ -169,7 +182,7 @@ def _organic_distort(dx: np.ndarray, dy: np.ndarray, dist: np.ndarray,
         p = _cell_rand(gi, gj, seed, k + 10) * math.tau
         mod += weight * a * np.sin(k * theta + p)
 
-    # 保證縮放係數為正，避免距離場翻轉造成網點破碎
+    # 保證縮放係數為正，避免距離場翻轉造成墨點破碎
     return dist * np.maximum(1.0 + amp * mod, 0.15)
 
 
@@ -178,19 +191,19 @@ def _dot_metric(params: HalftoneParams, cell: int,
                 origin_x: int = 0, origin_y: int = 0,
                 full_w: int | None = None,
                 full_h: int | None = None) -> np.ndarray:
-    """到最近網點中心的「形狀距離」場（整圖絕對座標）。
+    """到最近墨點中心的「形狀距離」場（整圖絕對座標）。
 
     位置與形狀是兩條獨立的軸：
-      - 位置：由 stochastic 決定。100% 為規則網格，0% 為網點
+      - 位置：由 stochastic 決定。100% 為規則網格，0% 為墨點
               中心各自隨機散開。
       - 形狀：由 dot_shape 決定，並對所有模式一致生效。
 
-    距離越接近 0 代表越靠近網點中心，在暗部會越早被填滿，
-    網點因此由中心向外自然長大 —— 這是 AM（振幅調變）網屏原理。
+    距離越接近 0 代表越靠近墨點中心，在暗部會越早被填滿，
+    墨點因此由中心向外自然長大 —— 這是 AM（振幅調變）網屏原理。
 
     重要：這裡一律使用「整張影像的絕對座標」，不對格點索引取模，
     也不做任何平鋪。早期實作把門檻場切成小磚重複貼滿全圖，導致
-    24MP 影像上同一組隨機值重複兩萬多次，宏觀看又變回規則網點，
+    24MP 影像上同一組隨機值重複兩萬多次，宏觀看又變回規則墨點，
     而且磚塊邊界會出現明顯接縫。
 
     origin_x / origin_y：目前陣列在「整張原圖」中的左上角座標。
@@ -221,7 +234,7 @@ def _dot_metric(params: HalftoneParams, cell: int,
     gi = np.rint(rx / cell).astype(np.int64)
     gj = np.rint(ry / cell).astype(np.int64)
 
-    # 網點中心 = 規則格點 + 隨機位移（有序模式位移為 0）
+    # 墨點中心 = 規則格點 + 隨機位移（有序模式位移為 0）
     amp = (1.0 - params.stochastic) * cell * 0.35
     if amp > 1e-6:
         jx = (_cell_rand(gi, gj, params.seed, 1) * 2.0 - 1.0) * amp
@@ -234,13 +247,23 @@ def _dot_metric(params: HalftoneParams, cell: int,
 
     # ── 形狀距離 ───────────────────────────────────────────
     if params.dot_shape == DOT_SQUARE:
-        # 切比雪夫距離 -> 方形網點
+        # 切比雪夫距離 -> 方形墨點
         dist = np.maximum(np.abs(dx), np.abs(dy))
-    elif params.dot_shape == DOT_ELLIPSE:
-        # 沿旋轉軸拉伸 -> 橢圓網點
-        dist = np.hypot(dx / 1.5, dy / 0.78)
+    elif params.dot_shape == DOT_CROSS:
+        # 十字架 = 水平臂 ∪ 垂直臂，兩者各自是矩形。
+        #
+        # 對單一矩形 max(|x|/a, |y|/b)，其等值線 {f <= t} 恰是該矩形；
+        # 兩個矩形取最小值即為聯集，等值線因此正好是十字架，
+        # 不是用圓角或疊加硬湊出來的近似形狀。
+        arm = cell * 0.16       # 臂寬
+        reach = cell * 0.48     # 臂長（未滿一格，滿墨時仍留白）
+        ax = np.abs(dx)
+        ay = np.abs(dy)
+        bar_h = np.maximum(ax / reach, ay / arm)
+        bar_v = np.maximum(ax / arm, ay / reach)
+        dist = np.minimum(bar_h, bar_v)
     else:
-        # 歐氏距離 -> 圓形網點（隨機有機模式以此為基礎再擾動）
+        # 歐氏距離 -> 圓形墨點（有機隨機模式以此為基礎再擾動）
         dist = np.hypot(dx, dy)
 
     # 隨機有機模式：每顆顆粒套用專屬的隨機輪廓，模擬銀鹽晶體
@@ -260,7 +283,7 @@ _CDF_BINS = 16384
 def _rank_uniform(values: np.ndarray) -> np.ndarray:
     """把距離場轉為 0..1 上均勻分佈的門檻場（以直方圖近似 CDF）。
 
-    為什麼需要這一步：網點位置隨機抖動之後，相鄰網點會互相靠近甚至
+    為什麼需要這一步：墨點位置隨機抖動之後，相鄰墨點會互相靠近甚至
     重疊。此時單純用「面積正比於距離平方」計算，會把重疊的部分重複
     計入，導致暗部實際上墨率嚴重偏低（實測最多低估 30%）。
 
@@ -296,7 +319,7 @@ def _rank_uniform(values: np.ndarray) -> np.ndarray:
 
 
 def _tie_break(gy: np.ndarray, gx: np.ndarray, seed: int) -> np.ndarray:
-    """依網格座標產生固定的 0..1 亂數，用於決定該網點的歸屬。
+    """依網格座標產生固定的 0..1 亂數，用於決定該墨點的歸屬。
 
     使用確定性雜湊，確保同一 seed 必定得到相同結果，
     讓參數微調可以重現。
@@ -311,19 +334,52 @@ def _tie_break(gy: np.ndarray, gx: np.ndarray, seed: int) -> np.ndarray:
 
 
 def _cell_px(params: HalftoneParams) -> int:
-    """每個網點網格佔用的像素數。
+    """每個網屏格佔用的像素數。
 
-    lpi（每吋線數）與 dpi（每吋點數）共同決定網點實際大小。
-    grain_scale 用來整體放大或縮小顆粒。
+    網屏線數（lpi）與解析度（dpi，每吋像素數）共同決定墨點大小：
+    同一張圖印得越寬，格子在像素上就越大。
+
+    這裡不再乘顆粒粗細倍率 —— 舊版「解析度 / 網屏線數 / 顆粒粗細」
+    三個參數只透過比值影響同一件事，已合併為「印刷寬度 + 網屏線數」。
     """
-    raw = params.resolution / params.frequency * params.grain_scale
-    return max(1, min(512, int(round(raw))))
+    return max(1, min(512, int(round(params.resolution /
+                                       params.frequency))))
+
+
+def physical_metrics(params: HalftoneParams) -> dict[str, float]:
+    """推算目前設定下的實體數值，供介面顯示。
+
+    網屏線數決定墨點的物理間距；覆蓋率換成圓形墨點的直徑。
+    這些值與影像像素數無關，只與「印多寬」和「幾 lpi」有關。
+    """
+    pitch_mm = 25.4 / params.frequency          # 墨點間距（mm）
+    cell = _cell_px(params)                     # 間距（像素）
+    dpi = params.resolution
+
+    def diameter_mm(area: float) -> float:
+        # 圓形墨點：面積比例 = π d² / (4 p²)  =>  d = 2p√(area/π)
+        return 2.0 * pitch_mm * math.sqrt(max(0.0, area) / math.pi)
+
+    def diameter_px(area: float) -> float:
+        return diameter_mm(area) / 25.4 * dpi
+
+    return {
+        "dpi": dpi,
+        "pitch_mm": pitch_mm,
+        "pitch_px": float(cell),
+        "mid_mm": diameter_mm(0.5),             # 50% 網調
+        "mid_px": diameter_px(0.5),
+        "min_mm": diameter_mm(params.min_ink),  # 範圍下限
+        "min_px": diameter_px(params.min_ink),
+        "max_mm": diameter_mm(params.max_ink),  # 範圍上限
+        "max_px": diameter_px(params.max_ink),
+    }
 
 
 def halftone(gray: np.ndarray, params: HalftoneParams,
              origin: tuple[int, int] = (0, 0),
              full_shape: tuple[int, int] | None = None) -> np.ndarray:
-    """將灰階圖轉為二值半調網點（黑墨白底）。
+    """將灰階圖轉為二值半調墨點（黑墨白底）。
 
     輸入 : (H, W) 或 (H, W, 1) 灰階，取值 0..1（0 = 黑）
     輸出 : (H, W) 的 uint8，0 = 滿墨（黑）、255 = 紙白
@@ -346,13 +402,19 @@ def halftone(gray: np.ndarray, params: HalftoneParams,
     if tone.size == 0:
         raise ValueError("影像為空，無法處理")
 
-    # 網點擴大補償：以 gamma 把中間調壓暗，使實際網點面積增大
+    # 墨點擴大補償：以 gamma 把中間調壓暗，使實際墨點面積增大
     t = _clamp01(tone)
     if params.dot_gain > 0.0:
         t = np.power(t, 1.0 + params.dot_gain)
 
-    # 最小 / 最大網點夾限：暗部保留細節、高光避免死黑
-    t = np.clip(t, params.min_dot, params.max_dot)
+    # 墨點大小範圍：以「墨量」夾限。
+    # t 是亮度（1 = 白），暗度為 1 - t，因此要反轉：
+    #   最小墨量 min_ink -> 亮度不得高於 1 - min_ink
+    #   最大墨量 max_ink -> 亮度不得低於 1 - max_ink
+    # 舊版寫成 clip(t, min_dot, max_dot)，等於用「最小墨點」去限制
+    # 黑區、用「最大墨點」去限制白區，名實相反。預設 0.03 / 0.95
+    # 會強迫純白區也有 4.9% 墨量，高光因此出現一堆只有幾像素的碎點。
+    t = np.clip(t, 1.0 - params.max_ink, 1.0 - params.min_ink)
 
     height, width = t.shape
     cell = _cell_px(params)
@@ -378,7 +440,7 @@ def halftone(gray: np.ndarray, params: HalftoneParams,
                            origin_x=ox, origin_y=oy,
                            full_w=full_w, full_h=full_h)
 
-        # 網點不規則度：以低頻諧波擾動距離場，讓網點邊界有機。
+        # 墨點不規則度：以低頻諧波擾動距離場，讓墨點邊界有機。
         # 隨機有機模式已在 _organic_distort 內逐顆擾動，此處略過。
         if params.shape_amount > 0.0 and params.dot_shape != DOT_ORGANIC:
             yy = (np.arange(rows, dtype=np.float64)[:, None] + oy + y0) / cell

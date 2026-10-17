@@ -327,6 +327,23 @@ QLabel#imageView {
     color: #c07a99;
     font-size: 15px;
 }
+
+/* ── 印刷尺寸的只讀數值 ───────────────────────── */
+QLabel#readoutValue {
+    background-color: #fff4f8;
+    border: 1px solid #ffd0e2;
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: #8c2a55;
+    font-size: 12px;
+    font-weight: bold;
+}
+
+/* 說明文字：小字、淡色，不搶視覺 */
+QLabel#hintText {
+    color: #a06a86;
+    font-size: 11px;
+}
 """
 
 _CACHED: str | None = None
