@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -217,6 +218,59 @@ def test_ink_range_semantics():
     assert 0.68 < float((r[:, 160:] == 0).mean()) < 0.72
 
 
+def test_min_dot_filter_discards_small_dots():
+    """最小墨點過濾：過小的墨點必須整個捨棄、留白。
+
+    與 min_ink 方向相反：min_ink 把墨點**撐大**到下限，
+    過濾則把過小的墨點**丟掉**，寧可留白也不印碎點。
+    """
+    img = np.full((300, 300), 0.90, dtype=np.float32)
+    base = dict(dot_gain=0.0, frequency=40.0, resolution=750.0,
+                stochastic=1.0, angle=0.0)
+
+    r = halftone(img, _flat(**base))
+    ink = float((r == 0).mean())
+    assert 0.08 < ink < 0.12, f"基準上墨率應約 0.10，實測 {ink:.3f}"
+
+    d = 2.0 * (25.4 / 40.0) * math.sqrt(ink / math.pi)
+    r = halftone(img, _flat(filter_mm=d * 0.9, **base))
+    assert float((r == 0).mean()) > 0.9 * ink, "門檻較小時不該丟棄"
+
+    r = halftone(img, _flat(filter_mm=d * 1.1, **base))
+    assert float((r == 0).mean()) == 0.0, "過小的墨點應完全留白"
+
+
+def test_min_dot_filter_beats_ink_floor():
+    """過濾優先級高於下限：下限撐大的墨點，只要仍小於門檻就照樣丟棄。"""
+    img = np.full((300, 300), 0.90, dtype=np.float32)
+    base = dict(dot_gain=0.0, frequency=40.0, resolution=750.0,
+                stochastic=1.0, angle=0.0)
+    pitch = 25.4 / 40.0
+
+    # 下限 30 % 會把每個格子都撐到 30 % 墨量
+    r = halftone(img, _flat(min_ink=0.30, **base))
+    assert float((r == 0).mean()) > 0.2, "下限本身應有效果"
+
+    # 門檻必須超過「被下限撐大後」的直徑，否則本來就不該被丟
+    d_floor = 2.0 * pitch * math.sqrt(0.30 / math.pi)
+    r = halftone(img, _flat(min_ink=0.30, filter_mm=d_floor * 1.05,
+                            **base))
+    assert float((r == 0).mean()) == 0.0, "過濾必須優先於下限"
+
+    # 門檻低於撐大後的直徑時，下限仍然生效
+    r = halftone(img, _flat(min_ink=0.30, filter_mm=d_floor * 0.9,
+                            **base))
+    assert float((r == 0).mean()) > 0.2, "門檻較小時下限應保留"
+
+
+def test_filter_zero_means_disabled():
+    img = np.full((200, 200), 0.88, dtype=np.float32)
+    a = halftone(img, _flat(dot_gain=0.0, frequency=40.0, resolution=750.0))
+    b = halftone(img, _flat(dot_gain=0.0, frequency=40.0, resolution=750.0,
+                            filter_mm=0.0))
+    assert np.array_equal(a, b)
+
+
 def test_physical_metrics():
     """實體數值推算：印刷寬度決定 dpi，lpi 決定間距。"""
     p = HalftoneParams(print_width_mm=152.4, frequency=40.0,
@@ -225,7 +279,6 @@ def test_physical_metrics():
     assert abs(m["dpi"] - 750.0) < 1.0
     assert abs(m["pitch_mm"] - 25.4 / 40.0) < 1e-6
     # 圓形墨點 50% 覆蓋率 -> 直徑 = 2 * 間距 * sqrt(0.5/pi)
-    import math
     want = 2.0 * m["pitch_mm"] * math.sqrt(0.5 / math.pi)
     assert abs(m["mid_mm"] - want) < 1e-9
 

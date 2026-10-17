@@ -445,10 +445,23 @@ class MainWindow(QMainWindow):
         self.rng_ink.changed.connect(self._on_changed)
         add_row(kl, "墨點大小範圍", self.rng_ink)
 
+        # 最小墨點過濾：直徑小於門檻的墨點直接丟棄、留白。
+        # 與「墨點大小範圍」方向相反 —— 範圍是把墨點撐大，
+        # 過濾是把過小的墨點整個去掉。
+        self.sld_filter = SliderSpin(0.0, 5.0, 0.0, 2, 0.01, " mm")
+        self.sld_filter.changed.connect(self._on_changed)
+        add_row(kl, "最小墨點過濾", self.sld_filter)
+
         tip = QLabel("墨點大小範圍：0 % = 紙白無點，100 % = 完全密實填充")
         tip.setWordWrap(True)
         tip.setObjectName("hintText")
         kl.addWidget(tip)
+
+        tip_f = QLabel("最小墨點過濾：直徑小於門檻的墨點直接捨棄、完全留白；"
+                       "0 = 不過濾")
+        tip_f.setWordWrap(True)
+        tip_f.setObjectName("hintText")
+        kl.addWidget(tip_f)
 
         tip2 = QLabel("隨機墨點占比 0% = 隨機顆粒，100% = 傳統有序墨點")
         tip2.setWordWrap(True)
@@ -652,6 +665,7 @@ class MainWindow(QMainWindow):
             dot_gain=self.sld_gain.value(),
             min_ink=lo,
             max_ink=hi,
+            filter_mm=self.sld_filter.value(),
             seed=self._seed,
         )
 
@@ -676,6 +690,12 @@ class MainWindow(QMainWindow):
         ]
         if params.min_ink > 0.0 and m["min_px"] < 1.5:
             lines.append("⚠ 最小墨點不足 1.5 px，印不出來")
+        if params.filter_mm > 0.0:
+            fpx = params.filter_mm / 25.4 * m["dpi"]
+            lines.append(f"過濾門檻 {params.filter_mm:.3f} mm"
+                         f"（{fpx:.1f} px）")
+            if params.filter_mm >= m["pitch_mm"]:
+                lines.append("⚠ 門檻已達網點間距，整張會變成全白")
         if m["pitch_px"] < 1.0:
             lines.append("⚠ 網屏線數過高，已超出影像解析度")
         self.lbl_metrics.setText("\n".join(lines))
@@ -762,6 +782,7 @@ class MainWindow(QMainWindow):
         self.sld_irreg.set_value(d.shape_amount)
         self.sld_gain.set_value(d.dot_gain)
         self.rng_ink.set_values(d.min_ink, d.max_ink)
+        self.sld_filter.set_value(d.filter_mm)
         self.sld_noise.set_value(d.noise_size)
         # 印刷寬度預設六寸，切到寸時顯示值也要跟著換
         if self._unit_is_inch():

@@ -59,6 +59,7 @@ class HalftoneParams:
     dot_gain: float = 0.15           # 墨點擴大補償 0..0.6
     min_ink: float = 0.0             # 最小墨點覆蓋率 0..1
     max_ink: float = 1.0             # 最大墨點覆蓋率 0..1
+    filter_mm: float = 0.0           # 最小墨點過濾（mm）；0 = 不過濾
     seed: int = 0                    # 隨機種子
 
     # 內部推導量：由介面依實際送去算的像素寬度算出，不開放編輯。
@@ -90,6 +91,8 @@ class HalftoneParams:
             errors.append("最大墨點覆蓋率須介於 0 ~ 100%")
         if self.min_ink > self.max_ink:
             errors.append("最小墨點覆蓋率不可大於最大墨點覆蓋率")
+        if not (0.0 <= self.filter_mm <= 100.0):
+            errors.append("最小墨點過濾須介於 0 ~ 100 mm")
         if not (0 <= self.dot_shape < len(DOT_SHAPES)):
             errors.append("墨點形狀設定無效")
         if self.resolution <= 0.0:
@@ -373,6 +376,10 @@ def physical_metrics(params: HalftoneParams) -> dict[str, float]:
         "min_px": diameter_px(params.min_ink),
         "max_mm": diameter_mm(params.max_ink),  # 範圍上限
         "max_px": diameter_px(params.max_ink),
+        "filter_mm": params.filter_mm,
+        # 過濾門檻換算成覆蓋率，供介面判斷是否過大
+        "filter_area": (math.pi * (params.filter_mm / pitch_mm) ** 2 / 4.0
+                        if params.filter_mm > 0.0 else 0.0),
     }
 
 
@@ -415,6 +422,21 @@ def halftone(gray: np.ndarray, params: HalftoneParams,
     # 黑區、用「最大墨點」去限制白區，名實相反。預設 0.03 / 0.95
     # 會強迫純白區也有 4.9% 墨量，高光因此出現一堆只有幾像素的碎點。
     t = np.clip(t, 1.0 - params.max_ink, 1.0 - params.min_ink)
+
+    # 最小墨點過濾：直徑小於門檻的墨點**整個捨棄、留白**。
+    #
+    # 這與 min_ink 方向相反：min_ink 是把墨點**撐大**到下限，
+    # 過濾則是把過小的墨點**丟掉**，寧可留白也不印那種一兩個像素
+    # 的碎點 —— 在絲印上，那種點不是印不出來就是糊成一團灰。
+    #
+    # 放在夾限之後，過濾才是最終裁決者：即使下限被調高，
+    # 低於門檻的墨點依然不會印出來。
+    if params.filter_mm > 0.0:
+        pitch_mm = 25.4 / params.frequency
+        # 圓形墨點：面積比例 a = π(d/p)²/4  =>  a = π(d/p)²/4
+        a_min = math.pi * (params.filter_mm / pitch_mm) ** 2 / 4.0
+        # 墨量 = 1 - t，低於門檻者直接設為純白
+        t = np.where((1.0 - t) < a_min, 1.0, t)
 
     height, width = t.shape
     cell = _cell_px(params)
