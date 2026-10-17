@@ -82,16 +82,22 @@ def main() -> int:
             if exif_count or keys:
                 print("         [失敗] PNG 仍帶有中繼資料")
                 ok = False
-            back = np.asarray(Image.open(out))
+            # PNG 以 1-bit 雙色輸出，讀回須先轉成 L 才是 0/255；
+            # 直接 asarray 會拿到 0/1 而誤判為像素不符。
+            back = np.asarray(Image.open(out).convert("L"))
             if not np.array_equal(back, result):
                 print("         [失敗] PNG 像素與原始結果不符")
                 ok = False
+            elif im.mode != "1":
+                print(f"         [失敗] PNG 應為 1-bit 雙色，"
+                      f"實際 mode={im.mode}")
+                ok = False
             else:
-                print("         [通過] 像素完全一致（無損）")
+                print("         [通過] 像素完全一致（無損、1-bit 雙色）")
 
         # JPEG 為有損，但格式與灰階必須正確
         else:
-            back = np.asarray(Image.open(out))
+            back = np.asarray(Image.open(out).convert("L"))
             gray_levels = len(np.unique(back))
             print(f"         [注意] 有損壓縮，灰階種類 {gray_levels} 種"
                   f"（原始為 2 種）")

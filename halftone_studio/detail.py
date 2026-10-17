@@ -10,14 +10,16 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPoint, QPointF, Qt, Signal
+from PySide6.QtGui import (
+    QColor, QImage, QPainter, QPen, QPixmap, QPolygonF,
+)
 from PySide6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout,
     QWidget,
 )
 
-__all__ = ["DetailPane", "CROP_SIZES"]
+__all__ = ["DetailPane", "DetailWindow", "CROP_SIZES"]
 
 # 可選的裁切範圍（全解析度像素，寬 x 高）
 CROP_SIZES = [(640, 480), (960, 720), (1400, 1050)]
@@ -66,17 +68,20 @@ class DetailPane(QWidget):
         bar.addWidget(btn_center)
 
         bar.addStretch(1)
-
-        self.lbl_info = QLabel("尚未載入影像")
-        self.lbl_info.setStyleSheet("color: #a06a86; font-size: 11px;")
-        bar.addWidget(self.lbl_info)
-
         root.addLayout(bar)
+
+        # 座標資訊另起一行。若與工具列同一行，這段文字的最小寬度
+        # 會把視窗撐到 1280px 以上，連帶把標題列的關閉鈕擠出畫面。
+        self.lbl_info = QLabel("尚未載入影像")
+        self.lbl_info.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_info.setStyleSheet("color: #a06a86; font-size: 11px;")
+        self.lbl_info.setMinimumWidth(0)
+        root.addWidget(self.lbl_info)
 
         # ── 影像區 ──────────────────────────────────────
         self.lbl = QLabel("尚未載入影像")
         self.lbl.setAlignment(Qt.AlignCenter)
-        self.lbl.setMinimumHeight(180)
+        self.lbl.setMinimumSize(1, 1)     # 不可省略：見下方說明
         self.lbl.setStyleSheet(
             "background: #fff0f5; border: 1.5px solid #ffc0d6;"
             "border-radius: 8px; color: #c07a99;")
@@ -85,6 +90,10 @@ class DetailPane(QWidget):
         self.scroll.setWidget(self.lbl)
         self.scroll.setWidgetResizable(False)
         self.scroll.setAlignment(Qt.AlignCenter)
+        # QScrollArea 的最小尺寸預設會吃進內部 widget 的需求。放大後的
+        # 標籤可能是 1280x960，若不設下限，整個浮動視窗就會被撐成一樣大。
+        # 明確指定下限，讓視窗維持在使用者設定的大小、影像改以捲動顯示。
+        self.scroll.setMinimumSize(240, 150)
         root.addWidget(self.scroll, 1)
 
     # ── 資料 ────────────────────────────────────────────
@@ -172,3 +181,177 @@ class DetailPane(QWidget):
     def _on_zoom(self, index: int) -> None:
         self._zoom = index + 1
         self._render()
+
+
+# ── 浮動細節視窗 ────────────────────────────────
+class _ResizeGrip(QWidget):
+    """左上角的三角控制點：往左上拖曳即可放大視窗。
+
+    一般視窗靠右下角放大，但這是浮在主視窗上的小窗，實務上要往
+    左上拉才不會把主畫面推出去 —— 右下角被主視窗邊界擋住。
+    因此這個控制點放左上角，拖曳時固定右下角為錨點。
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(16, 16)
+        self.setCursor(Qt.SizeFDiagCursor)
+        self.setToolTip("往左上拖曳可放大視窗")
+        self._start: tuple | None = None
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(184, 57, 111, 160))
+        w, h = self.width(), self.height()
+        # 左上角 L 形：兩條對角線段
+        p.drawPolygon(QPolygonF([QPointF(0, 0), QPointF(w, 0),
+                                 QPointF(0, h)]))
+        p.setBrush(QColor(255, 255, 255, 200))
+        p.drawPolygon(QPolygonF([QPointF(3, 3), QPointF(w - 3, 3),
+                                 QPointF(3, h - 3)]))
+        p.end()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            win = self.window()
+            self._start = (event.globalPosition().toPoint(),
+                           win.geometry())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._start is None or not (event.buttons() & Qt.LeftButton):
+            return
+        origin_pos, origin_geo = self._start
+        win = self.window()
+        delta = event.globalPosition().toPoint() - origin_pos
+
+        # 右下角固定，往左上拉 => 尺寸變大、起點往左上移
+        right = origin_geo.right()
+        bottom = origin_geo.bottom()
+        width = min(origin_geo.width() - delta.x(), win.maximumWidth() or 10**6)
+        height = min(origin_geo.height() - delta.y(), win.maximumHeight() or 10**6)
+        width = max(width, win.minimumWidth())
+        height = max(height, win.minimumHeight())
+        win.setGeometry(right - width + 1, bottom - height + 1,
+                        width, height)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._start = None
+        super().mouseReleaseEvent(event)
+
+
+class DetailWindow(QWidget):
+    """浮動的細節放大視窗。
+
+    做成獨立的無邊框視窗而非底部面板，才能疊在主預覽之上，
+    不佔用固定版面；使用者可隨時拖到任何位置或關閉。
+    """
+
+    def __init__(self, pane: DetailPane,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint)
+        # 保留在主視窗之上，且不搶焦點，點擊主預覽仍能改變選取位置
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setMinimumSize(320, 240)
+        self.setMaximumSize(2400, 1800)
+        self.pane = pane
+        self._target: QWidget | None = None
+        self._offset = QPoint(0, 0)
+        self._drag_from: tuple | None = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.setSpacing(0)
+
+        # ── 標題列：左上角控制點 + 可拖曳區 + 關閉鈕 ──
+        bar = QWidget()
+        bar.setFixedHeight(22)
+        bar.setStyleSheet(
+            "background: #ffd6e6; border-bottom: 1px solid #f0a8c8;")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(0, 0, 2, 0)
+        bl.setSpacing(0)
+        bl.addWidget(_ResizeGrip(bar))
+
+        self.title = QLabel(" 細節放大（拖曳可移動）")
+        self.title.setStyleSheet(
+            "color: #8c2a55; font-size: 11px; font-weight: bold;"
+            "background: transparent;")
+        bl.addWidget(self.title, 1)
+
+        # 用 U+00D7 乘號而非 U+2715 打叉：後者不在 Windows 預設
+        # 中文字型裡，會因缺字形而整個鈕畫不出來。
+        btn_close = QPushButton("×")
+        btn_close.setFixedSize(22, 18)
+        btn_close.setCursor(Qt.ArrowCursor)
+        btn_close.setToolTip("關閉細節放大視窗")
+        btn_close.setStyleSheet(
+            "QPushButton { background: transparent; border: none;"
+            " color: #b8396f; font-size: 15px; font-weight: bold;"
+            " padding: 0; }"
+            "QPushButton:hover { background: #ff7fb5; color: white; }")
+        btn_close.clicked.connect(self.hide)
+        bl.addWidget(btn_close)
+
+        outer.addWidget(bar)
+        outer.addWidget(self.pane, 1)
+        self._bar = bar
+
+    # ── 位置 ────────────────────────────────────────────
+    # 浮動視窗的右下角恆常錨定在主預覽區的右下角。使用者仍可拖曳
+    # 移動，移動量會記成相對錨點的偏移，主視窗移動或縮放時依此
+    # 偏移重新定位，因此「右下角對齊」的關係始終成立。
+    MARGIN = 12
+
+    def anchor_to(self, target: QWidget) -> None:
+        """把右下角錨定到目標元件（主預覽區）的右下角。"""
+        self._target = target
+        self.adjustSize()
+        w = min(max(self.sizeHint().width(), self.minimumWidth()), 720)
+        h = min(max(self.sizeHint().height(), self.minimumHeight()), 520)
+        self.resize(w, h)
+        self.reanchor()
+
+    def _anchor_local(self) -> QPoint:
+        """錨點在目標元件座標系中的位置。"""
+        t = getattr(self, "_target", None)
+        if t is None:
+            return QPoint(0, 0)
+        return QPoint(t.width() - self.width() - self.MARGIN,
+                      t.height() - self.height() - self.MARGIN)
+
+    def _anchor_global(self) -> QPoint:
+        t = getattr(self, "_target", None)
+        if t is None:
+            return self.pos()
+        return t.mapToGlobal(self._anchor_local())
+
+    def reanchor(self) -> None:
+        """依目前目標重新定位，保持右下角對齊與使用者的拖曳偏移。"""
+        t = getattr(self, "_target", None)
+        if t is None or not self.isVisible():
+            return
+        g = self._anchor_global()
+        self.move(g.x() + self._offset.x(), g.y() + self._offset.y())
+
+    def drag_begin(self, pos) -> None:
+        p = pos.toPoint() if hasattr(pos, "toPoint") else pos
+        self._drag_from = (p, self.geometry())
+
+    def drag_move(self, pos) -> None:
+        if self._drag_from is None:
+            return
+        origin, geo = self._drag_from
+        cur = pos.toPoint() if hasattr(pos, "toPoint") else pos
+        d = cur - origin
+        nx, ny = geo.x() + d.x(), geo.y() + d.y()
+
+        # 記成相對錨點的偏移，主視窗移動後才不會被拉回原位
+        anchor = self._anchor_global()
+        self._offset = QPoint(nx - anchor.x(), ny - anchor.y())
+        self.move(nx, ny)
+
+    def drag_end(self) -> None:
+        self._drag_from = None

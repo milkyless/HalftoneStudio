@@ -17,7 +17,7 @@ from PySide6.QtCore import (
 
 from .core import HalftoneParams, halftone
 
-__all__ = ["PreviewController"]
+__all__ = ["PreviewController", "ExportController"]
 
 
 class _Emitter(QObject):
@@ -133,6 +133,86 @@ class PreviewController(QObject):
         if self._busy:
             self._busy = False
             self.busy_changed.emit(False)
+
+    def shutdown(self) -> None:
+        self._pool.clear()
+        self._pool.waitForDone(3000)
+
+
+# ── 匯出 ──────────────────────────────────────
+class _ExportEmitter(QObject):
+    """匯出結果回報。"""
+
+    done = Signal(str, str, float, int, int)   # 路徑, 格式, 上墨率, 寬, 高
+    failed = Signal(str)
+
+
+class _ExportTask(QRunnable):
+    """在背景執行緒完成「全解析度半調 + 寫檔」。
+
+    24MP 影像的半調運算約需 10 秒，若在主執行緒進行，視窗會完全
+    沒有反應（Windows 會標示「未回應」）。因此整個流程都放到背景。
+    """
+
+    def __init__(self, emitter: _ExportEmitter, gray: np.ndarray,
+                 params: HalftoneParams, path: str) -> None:
+        super().__init__()
+        self._emitter = emitter
+        self._gray = gray
+        self._params = params
+        self._path = path
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            from .image_io import save_image
+            result = halftone(self._gray, self._params)
+            fmt = save_image(result, self._path)
+            ink = float((result == 0).mean()) * 100.0
+            self._emitter.done.emit(self._path, fmt, ink,
+                                    result.shape[1], result.shape[0])
+        except Exception as exc:  # noqa: BLE001
+            self._emitter.failed.emit(str(exc))
+
+
+class ExportController(QObject):
+    """在背景執行緒匯出，避免介面凍結。"""
+
+    done = Signal(str, str, float, int, int)
+    failed = Signal(str)
+    busy_changed = Signal(bool)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)
+
+        self._emitter = _ExportEmitter(self)
+        # 內部先收尾（清除 busy），再對外通知，
+        # 確保呼叫端收到 done 時 busy 已經是 False。
+        self._emitter.done.connect(self._on_task_finished)
+        self._emitter.failed.connect(self._on_task_finished)
+        self._emitter.done.connect(self.done)
+        self._emitter.failed.connect(self.failed)
+
+        self._busy = False
+
+    def _on_task_finished(self, *args) -> None:
+        self._busy = False
+        self.busy_changed.emit(False)
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def start(self, gray: np.ndarray, params: HalftoneParams,
+              path: str) -> None:
+        if gray is None:
+            return
+        if not self._busy:
+            self._busy = True
+            self.busy_changed.emit(True)
+        self._pool.start(_ExportTask(self._emitter, gray, params, path))
 
     def shutdown(self) -> None:
         self._pool.clear()

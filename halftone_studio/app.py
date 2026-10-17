@@ -12,7 +12,7 @@ import sys
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QImage, QPainter, QPen, QPixmap,
 )
@@ -25,13 +25,13 @@ from PySide6.QtWidgets import (
 from .core import (
     DOT_SHAPES, HalftoneParams, halftone,
 )
-from .detail import DetailPane
+from .detail import DetailPane, DetailWindow
 from .image_io import (
     OUTPUT_FILTER, PREVIEW_MAX_EDGE, ImageError, image_format_of,
-    is_lossy_format, load_image, load_image_rgb, save_image,
+    is_lossy_format, load_image, load_image_rgb,
 )
 from .icons import app_icon
-from .preview import PreviewController
+from .preview import ExportController, PreviewController
 from .theme import get_stylesheet
 from .widgets import SliderSpin, add_row, build_group
 
@@ -59,6 +59,7 @@ class ImageView(QLabel):
         self._pixmap: QPixmap | None = None
         self._crop: tuple[int, int, int, int] | None = None
         self._shown_scale = 1.0
+        self._full_size: tuple[int, int] | None = None
         self._zoom = 1.0
         self._fit = True
 
@@ -138,14 +139,33 @@ class ImageView(QLabel):
         self.update()
 
     def crop_to_image(self, px: int, py: int) -> tuple[int, int] | None:
-        """把視窗座標換算回影像座標。"""
+        """把視窗座標換算回「整張原圖」座標。
+
+        總覽顯示的是縮圖，但裁切框與細節窗格都使用全解析度座標。
+        兩者比例不同，若直接把縮圖座標當全解析度座標使用，
+        24MP 影像會有 23% 以上的定位誤差。
+        """
         if self._pixmap is None:
             return None
-        off = self._pixmap_offset()
         s = self._shown_scale
         if s <= 0:
             return None
-        return (int((px - off[0]) / s), int((py - off[1]) / s))
+
+        # 視窗 -> 顯示中的縮圖
+        off = self._pixmap_offset()
+        disp_x = (px - off[0]) / s
+        disp_y = (py - off[1]) / s
+
+        # 縮圖 -> 整張原圖
+        dw, dh = self._pixmap.width(), self._pixmap.height()
+        if not self._full_size or not dw or not dh:
+            return (int(disp_x), int(disp_y))
+        fw, fh = self._full_size
+        return (int(disp_x * fw / dw), int(disp_y * fh / dh))
+
+    def set_full_size(self, width: int, height: int) -> None:
+        """告知總覽所顯示的縮圖對應的原圖尺寸。"""
+        self._full_size = (width, height)
 
     def _pixmap_offset(self) -> tuple[int, int]:
         if self._pixmap is None:
@@ -208,7 +228,11 @@ class MainWindow(QMainWindow):
         self.controller.failed.connect(self._on_error)
         self.controller.busy_changed.connect(self._on_busy)
 
-        # 細節窗格同樣在背景執行緒計算全解析度結果
+        # 匯出同樣在背景執行緒進行，24MP 約需 10 秒
+        self.export_ctrl = ExportController(self)
+        self.export_ctrl.done.connect(self._on_export_done)
+        self.export_ctrl.failed.connect(self._on_export_failed)
+
         self.detail_ctrl = PreviewController(self)
         self.detail_ctrl.ready.connect(self.detail.set_result)
         self.detail_ctrl.failed.connect(self._on_error)
@@ -230,6 +254,13 @@ class MainWindow(QMainWindow):
         scroll.setWidget(self.view)
         scroll.setWidgetResizable(True)
         scroll.setAlignment(Qt.AlignCenter)
+        # QScrollArea 預設會畫一圈外框，疊在影像檢視區的虛線外，
+        # 看起來就是一條突兀的灰色實線。這裡明確移除。
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }")
+        scroll.viewport().setStyleSheet("background: transparent;")
 
         right = QWidget()
         right.setMinimumWidth(PANEL_MIN_WIDTH)
@@ -259,29 +290,27 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(1, 0)
         split.setSizes([1000, PANEL_MAX_WIDTH])
 
-        # ── 細節放大窗格 ──────────────────────────────────
+        # ── 細節放大視窗 ──────────────────────────────────
         # 以全解析度計算指定區域，結果與匯出檔案逐像素相同，
-        # 可真正檢視網點細節，避免縮圖預覽與實際產出不同調。
+        # 可真正檢視網點細節。做成浮動視窗疊在主預覽右下角，
+        # 不佔固定版面；可拖曳移動、往左上拉大、或直接關閉。
         self.detail = DetailPane()
         self.detail.crop_changed.connect(self._on_crop_changed)
         self.view.crop_clicked.connect(self.detail.move_crop)
+
+        self.detail_win = DetailWindow(self.detail)
+        self.detail_win.title.installEventFilter(self)
+        self.detail_win.closeEvent = self._on_detail_close
 
         top = QWidget()
         tl = QVBoxLayout(top)
         tl.setContentsMargins(0, 0, 0, 0)
         tl.addWidget(split)
 
-        vsplit = QSplitter(Qt.Vertical)
-        vsplit.addWidget(top)
-        vsplit.addWidget(self.detail)
-        vsplit.setStretchFactor(0, 1)
-        vsplit.setStretchFactor(1, 0)
-        vsplit.setSizes([620, 260])
-
         holder = QWidget()
         hl = QVBoxLayout(holder)
         hl.setContentsMargins(0, 0, 0, 0)
-        hl.addWidget(vsplit)
+        hl.addWidget(top)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -435,6 +464,15 @@ class MainWindow(QMainWindow):
         act_reset = QAction("重設為預設參數", self)
         act_reset.triggered.connect(self.on_reset_params)
         view_menu.addAction(act_reset)
+
+        view_menu.addSeparator()
+
+        self.act_detail = QAction("細節放大視窗", self)
+        self.act_detail.setCheckable(True)
+        self.act_detail.setChecked(True)
+        self.act_detail.setShortcut("Ctrl+D")
+        self.act_detail.toggled.connect(self.toggle_detail)
+        view_menu.addAction(self.act_detail)
 
         help_menu = bar.addMenu("說明")
         act_about = QAction("關於", self)
@@ -606,11 +644,21 @@ class MainWindow(QMainWindow):
         self._preview_scale = (self._gray.shape[1] / full.shape[1]
                                if full.shape[1] else 1.0)
 
+        # 總覽顯示縮圖，但裁切框用全解析度座標，需告知對應的原圖尺寸
+        self.view.set_full_size(full.shape[1], full.shape[0])
+
         self.view.set_rgb(self._rgb)
         self.view.fit()
         self.detail.set_gray(full)
         self.controller.set_gray(self._gray)
         self._update_actions()
+
+        # 影像載入後才顯示浮動視窗，否則開程式時會出現空白小窗
+        if self.act_detail.isChecked() and not self.detail_win.isVisible():
+            self.detail_win.anchor_to(self.view)
+            self.detail_win.show()
+            self.detail_win.raise_()
+            self.detail_win.reanchor()
 
         self.setWindowTitle(f"{APP_TITLE} — {name}")
         self.lbl_size.setText(
@@ -657,30 +705,70 @@ class MainWindow(QMainWindow):
 
         self.progress.setVisible(True)
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        QApplication.processEvents()
+        self._export_path = path
+        self._export_fmt = fmt
+        self.export_ctrl.start(self._full_gray, params, path)
 
-        try:
-            result = halftone(self._full_gray, params)
-            save_image(result, path)
-        except Exception as exc:
-            QMessageBox.critical(self, "匯出失敗", str(exc))
-            self._set_status("匯出失敗")
+    def _on_detail_close(self, event) -> None:  # noqa: N802
+        """關閉鈕只隱藏視窗，不銷毀 —— 使用者再次點按即可復原。"""
+        self.detail_win.hide()
+        if hasattr(self, "act_detail"):
+            self.act_detail.blockSignals(True)
+            self.act_detail.setChecked(False)
+            self.act_detail.blockSignals(False)
+        event.accept()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        # 浮動視窗標題列：按左鍵拖曳即可移動
+        win = getattr(self, "detail_win", None)
+        if win is not None and obj is win.title:
+            et = event.type()
+            if et == QEvent.MouseButtonPress and \
+                    event.button() == Qt.LeftButton:
+                self.detail_win.drag_begin(event.globalPosition())
+                return True
+            if et == QEvent.MouseMove and \
+                    (event.buttons() & Qt.LeftButton):
+                self.detail_win.drag_move(event.globalPosition())
+                return True
+            if et == QEvent.MouseButtonRelease:
+                self.detail_win.drag_end()
+                return True
+        return super().eventFilter(obj, event)
+
+    def toggle_detail(self, checked: bool) -> None:  # noqa: N802
+        if checked:
+            self.detail_win.anchor_to(self.view)
+            self.detail_win.show()
+            self.detail_win.raise_()
+            # show() 之後視窗實際尺寸才確定，再錨定一次
+            self.detail_win.reanchor()
         else:
-            ink = float((result == 0).mean()) * 100.0
-            self._set_status(
-                f"已匯出 {path.rsplit(chr(92), 1)[-1]}"
-                f"（{result.shape[1]}×{result.shape[0]}，上墨率 {ink:.1f}%）")
-            note = ("\n\n注意：JPEG 為有損格式，網點邊緣可能有灰階雜訊。"
-                    if is_lossy_format(fmt) else "")
-            QMessageBox.information(
-                self, "匯出完成",
-                f"已另存至：\n{path}\n\n"
-                f"格式 {fmt}（不含任何中繼資料）\n"
-                f"尺寸 {result.shape[1]} × {result.shape[0]} px\n"
-                f"上墨率 {ink:.1f}%{note}")
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.progress.setVisible(False)
+            self.detail_win.hide()
+
+    def _on_export_done(self, path: str, fmt: str, ink: float,
+                        width: int, height: int) -> None:
+        QApplication.restoreOverrideCursor()
+        self.progress.setVisible(False)
+
+        self._set_status(
+            f"已匯出 {path.rsplit(chr(92), 1)[-1]}"
+            f"（{width}×{height}，上墨率 {ink:.1f}%）")
+        bits = "1-bit 雙色" if fmt == "PNG" else "8 位元灰階"
+        note = ("\n\n注意：JPEG 為有損格式，網點邊緣可能有灰階雜訊。"
+                if is_lossy_format(fmt) else "")
+        QMessageBox.information(
+            self, "匯出完成",
+            f"已另存至：\n{path}\n\n"
+            f"格式 {fmt}（{bits}，不含任何中繼資料）\n"
+            f"尺寸 {width} × {height} px\n"
+            f"上墨率 {ink:.1f}%{note}")
+
+    def _on_export_failed(self, message: str) -> None:
+        QApplication.restoreOverrideCursor()
+        self.progress.setVisible(False)
+        QMessageBox.critical(self, "匯出失敗", message)
+        self._set_status("匯出失敗")
 
     def on_about(self) -> None:
         QMessageBox.about(
@@ -694,9 +782,25 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str) -> None:
         self.statusBar().showMessage(text)
 
+    def moveEvent(self, event) -> None:  # noqa: N802
+        super().moveEvent(event)
+        # 浮動視窗是獨立頂層視窗，不會跟著主視窗走，必須手動跟隨，
+        # 否則主視窗一移動，右下角就不再對齊。
+        dw = getattr(self, "detail_win", None)
+        if dw is not None:
+            dw.reanchor()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        dw = getattr(self, "detail_win", None)
+        if dw is not None:
+            dw.reanchor()
+
     def closeEvent(self, event) -> None:  # noqa: N802
         self.controller.shutdown()
         self.detail_ctrl.shutdown()
+        self.export_ctrl.shutdown()
+        self.detail_win.close()
         super().closeEvent(event)
 
 

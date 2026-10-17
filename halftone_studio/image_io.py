@@ -117,8 +117,9 @@ def save_image(array: np.ndarray, path: str, quality: int = 100) -> str:
 
     只寫入可見像素資料：不附加 EXIF、文字區塊或任何中繼資料。
 
-    以 L（8 位元灰階）模式輸出，確保是真正的黑白網點，
-    不會因 RGB 轉換讓邊緣出現灰階鋸齒。
+    PNG 以 1-bit（雙色）輸出 —— 半調結果本來就是純黑白，
+    1-bit 體積最小（約為 8 位元灰階的 1/8），且不會有任何灰階鋸齒。
+    JPEG 為格式限制，只能用 8 位元灰階。
 
     回傳實際寫入的檔案格式（'PNG' 或 'JPEG'）。
     """
@@ -128,22 +129,25 @@ def save_image(array: np.ndarray, path: str, quality: int = 100) -> str:
         array = np.clip(array, 0, 255).astype(np.uint8)
 
     fmt = image_format_of(path)
+    base = Image.fromarray(array, mode="L")
 
     # 明確指定 format，且不傳入任何 pnginfo / exif，
     # 確保輸出檔案不含中繼資料。
-    img = Image.fromarray(array, mode="L")
-
     try:
         if fmt == "JPEG":
-            img.save(path, format="JPEG",
-                     quality=max(1, min(100, quality)),
-                     subsampling=0,      # 4:4:4，不做色度抽樣
-                     optimize=True,
-                     exif=b"")           # 明確清空 EXIF
+            base.save(path, format="JPEG",
+                      quality=max(1, min(100, quality)),
+                      subsampling=0,      # 4:4:4，不做色度抽樣
+                      optimize=True,
+                      exif=b"")           # 明確清空 EXIF
         else:
-            img.save(path, format="PNG",
-                     optimize=True,
-                     pnginfo=None)       # 明確不寫入文字區塊
+            # 1-bit 雙色：不做抖動，只做門檻化。
+            # 輸出已是純 0/255，因此門檻化不會損失任何資訊。
+            bilevel = base.convert("1", dither=Image.NONE)
+            bilevel.save(path, format="PNG",
+                         optimize=True,
+                         bits=1,
+                         pnginfo=None)    # 明確不寫入文字區塊
     except Exception as exc:
         raise ImageError(f"無法寫入影像：{exc}") from exc
 
