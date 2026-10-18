@@ -7,24 +7,17 @@ venv/
 
 # 專案產物
 out/
-build/artifacts/
-*.spec
+build/
 dist/
+*.spec
+# PyInstaller 的打包設定屬於原始碼，必須納入版控，否則別人無法打包
+!halftone.spec
 
 # 舊 GIMP 外掛的相依標頭檔（僅供編譯用，體積大）
 deps/
 
 # 測試產物
-test/output/
 *.pgm
 *.png
 !docs/*.png
 *.log
-
-# 舊 GIMP 外掛的編譯與測試殘留（已废弃，僅供考古）
-test/*.log
-test/*_err.txt
-test/*_out.txt
-test/*_std.txt
-test/*.exe
-test/*.dll
