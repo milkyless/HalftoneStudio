@@ -20,3 +20,11 @@ test/output/
 *.png
 !docs/*.png
 *.log
+
+# 舊 GIMP 外掛的編譯與測試殘留（已废弃，僅供考古）
+test/*.log
+test/*_err.txt
+test/*_out.txt
+test/*_std.txt
+test/*.exe
+test/*.dll

@@ -4,6 +4,8 @@
 
 純 Python + NumPy 實作，**完全不依賴 GIMP 或任何外部影像軟體**。
 
+**開發：Film Halftone（AI 協作開發）** — 程式碼與文件由 AI 輔助產生與維護。
+
 ---
 
 ## 快速開始
@@ -22,6 +24,15 @@ python -m venv .venv
 ```powershell
 .venv\Scripts\python.exe tests\test_core.py
 ```
+
+### 打包成單檔 exe
+
+```powershell
+python -m pip install pyinstaller
+python -m PyInstaller halftone.spec --noconfirm --clean
+```
+
+產物在 `dist\HalftoneStudio.exe`（約 61 MB，免安裝 Python）。
 
 ---
 
